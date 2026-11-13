@@ -1,0 +1,3119 @@
+import os
+import sys
+import time
+import asyncio
+import logging
+import re
+import html
+import json
+import shutil
+import subprocess
+import uuid
+import ipaddress
+import base64
+import hmac
+import hashlib
+import http.cookiejar
+import urllib.request
+import urllib.parse
+from dataclasses import dataclass, field
+from pathlib import Path
+from urllib.parse import urlparse, parse_qs
+
+# --- АВТОМАТИЧЕСКАЯ УСТАНОВКА БИБЛИОТЕК ---
+try:
+    import yt_dlp
+    import static_ffmpeg
+    import imageio_ffmpeg
+    import speech_recognition as sr
+    from shazamio import Shazam
+    from PIL import Image as PILImage, ImageOps
+    from aiogram import Bot, Dispatcher, types, F
+    from aiogram.client.session.aiohttp import AiohttpSession
+    from aiogram.exceptions import TelegramForbiddenError
+    from aiogram.filters import Command, CommandStart, CommandObject
+    from aiogram.utils.keyboard import InlineKeyboardBuilder
+    from aiogram.fsm.context import FSMContext
+    from aiogram.fsm.state import State, StatesGroup
+    from aiogram.fsm.storage.memory import MemoryStorage
+except ImportError:
+    if os.environ.get("_BOTYARA_INSTALLED") == "1":
+        raise
+    print("Необходимые библиотеки не найдены, устанавливаю...")
+    subprocess.check_call([
+        sys.executable, "-m", "pip", "install",
+        "yt-dlp[default]", "Pillow", "aiogram==3.13.1",
+        "static-ffmpeg", "imageio-ffmpeg",
+        "shazamio", "SpeechRecognition",
+    ])
+    os.environ["_BOTYARA_INSTALLED"] = "1"
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+# Автообновление yt-dlp при старте
+if os.getenv("AUTO_UPDATE_YTDLP", "1") == "1" and os.environ.get("_BOTYARA_UPDATED") != "1":
+    os.environ["_BOTYARA_UPDATED"] = "1"
+    print("Проверяю обновления yt-dlp...")
+    try:
+        subprocess.call(
+            [sys.executable, "-m", "pip", "install", "-q", "-U", "yt-dlp[default]"],
+            timeout=240,
+        )
+    except Exception as exc:
+        print(f"Не удалось обновить yt-dlp: {exc}")
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+# --- ПАПКИ И НАСТРОЙКИ ---
+BASE_DIR = Path(__file__).resolve().parent
+DOWNLOAD_DIR = BASE_DIR / "downloads"
+DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+USERS_FILE = BASE_DIR / "users.json"
+REFERRALS_FILE = BASE_DIR / "referrals.json"
+INLINE_CACHE_FILE = BASE_DIR / "inline_cache.json"
+
+BOT_TOKEN = "8979644407:AAGNtDNDpT2HKNy2hCpl4STzhmzQxF1wFU0"
+BOT_USERNAME = "savetrackbyf_bot"
+LOG_GROUP_ID = -1003754208609
+
+# Дополнительные ИИ-ключи для распознавания мычания/насвистывания (по желанию можно задать через переменные окружения)
+GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY") or "").strip()
+ACR_HOST = (os.getenv("ACR_HOST") or "").strip()
+ACR_ACCESS_KEY = (os.getenv("ACR_ACCESS_KEY") or "").strip()
+ACR_SECRET_KEY = (os.getenv("ACR_SECRET_KEY") or "").strip()
+
+YTDLP_PROXY = (os.getenv("YTDLP_PROXY") or "").strip() or None
+COOKIES_FILE = Path(os.getenv("YTDLP_COOKIES") or (BASE_DIR / "cookies.txt"))
+
+MAX_TRACK_SECONDS = 90 * 60          # дольше 90 минут не качаем
+TG_FILE_LIMIT = 49 * 1024 * 1024     # лимит Telegram для отправки ботом ~50 МБ
+TG_VIDEO_DL_LIMIT = 20 * 1024 * 1024 # лимит Bot API на скачивание файлов из чата (20 МБ)
+MP3_BITRATE_STD = "192"              # Стандартный битрейт
+MP3_BITRATE_PRO = "320"              # PRO-битрейт (за реферала или выданный админом)
+PRO_REQUIRED_REFS = 1                # Сколько друзей нужно для открытия PRO (320 kbps + альбомы целиком)
+MAX_PARALLEL_DOWNLOADS = 3
+RESULTS_PER_PAGE = 6                 # Кнопок треков на одной странице поиска
+
+SUPPORTED_AUDIO_EXTS = {
+    ".mp3", ".wav", ".flac", ".ogg", ".oga", ".m4a", ".aac", ".opus", ".wma", ".aiff", ".alac"
+}
+
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+)
+BOT_USER_AGENT = "TelegramBot (like TwitterBot)"
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    stream=sys.stdout,
+)
+logger = logging.getLogger("music_bot")
+
+
+# --- АВТОПОДКЛЮЧЕНИЕ FFMPEG / FFPROBE ---
+def setup_ffmpeg() -> None:
+    if shutil.which("ffmpeg") and shutil.which("ffprobe"):
+        return
+
+    try:
+        logger.info("ffmpeg/ffprobe не найдены в PATH. Подключаю через static-ffmpeg...")
+        static_ffmpeg.add_paths()
+    except Exception:
+        logger.warning("Не удалось инициализировать static-ffmpeg", exc_info=True)
+
+    if shutil.which("ffmpeg") and shutil.which("ffprobe"):
+        logger.info("ffmpeg и ffprobe успешно подключены через static-ffmpeg!")
+        return
+
+    try:
+        exe = Path(imageio_ffmpeg.get_ffmpeg_exe())
+        if exe.is_file():
+            bin_dir = BASE_DIR / "ffmpeg_bin"
+            bin_dir.mkdir(parents=True, exist_ok=True)
+            target_name = "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
+            target_path = bin_dir / target_name
+            if not target_path.exists():
+                try:
+                    os.symlink(exe, target_path)
+                except OSError:
+                    shutil.copy2(exe, target_path)
+            os.environ["PATH"] = str(bin_dir) + os.pathsep + os.environ.get("PATH", "")
+            logger.info("ffmpeg подключён через imageio-ffmpeg: %s", target_path)
+    except Exception:
+        logger.warning("Не удалось подключить imageio-ffmpeg", exc_info=True)
+
+    if not shutil.which("ffmpeg"):
+        logger.warning(
+            "ffmpeg всё ещё недоступен — бот будет скачивать оригинальное аудио без перекодирования."
+        )
+
+
+setup_ffmpeg()
+
+bot = Bot(token=BOT_TOKEN, session=AiohttpSession(timeout=600))
+dp = Dispatcher(storage=MemoryStorage())
+shazam_client = Shazam()
+download_semaphore = asyncio.Semaphore(MAX_PARALLEL_DOWNLOADS)
+active_album_downloads: set[tuple[int, str]] = set()
+
+
+# --- БАЗА ПОЛЬЗОВАТЕЛЕЙ, КЭШ FILE_ID И РЕФЕРАЛЬНАЯ СИСТЕМА ---
+def load_users() -> set[int]:
+    try:
+        if USERS_FILE.exists():
+            data = json.loads(USERS_FILE.read_text(encoding="utf-8"))
+            return {int(x) for x in data}
+    except Exception:
+        logger.exception("Не удалось прочитать users.json")
+    return set()
+
+users_db: set[int] = load_users()
+
+def save_users() -> None:
+    temp_file = USERS_FILE.with_suffix(".json.tmp")
+    temp_file.write_text(json.dumps(sorted(users_db), ensure_ascii=False), encoding="utf-8")
+    temp_file.replace(USERS_FILE)
+
+def load_referrals() -> dict[str, dict]:
+    try:
+        if REFERRALS_FILE.exists():
+            data = json.loads(REFERRALS_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+    except Exception:
+        logger.exception("Не удалось прочитать referrals.json")
+    return {}
+
+referrals_db: dict[str, dict] = load_referrals()
+
+def save_referrals() -> None:
+    try:
+        temp_file = REFERRALS_FILE.with_suffix(".json.tmp")
+        temp_file.write_text(json.dumps(referrals_db, ensure_ascii=False, indent=2), encoding="utf-8")
+        temp_file.replace(REFERRALS_FILE)
+    except Exception:
+        logger.exception("Не удалось сохранить referrals.json")
+
+def load_inline_cache() -> dict[str, dict]:
+    try:
+        if INLINE_CACHE_FILE.exists():
+            data = json.loads(INLINE_CACHE_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+    except Exception:
+        logger.exception("Не удалось прочитать inline_cache.json")
+    return {}
+
+inline_audio_cache: dict[str, dict] = load_inline_cache()
+
+def save_inline_cache() -> None:
+    try:
+        temp_file = INLINE_CACHE_FILE.with_suffix(".json.tmp")
+        temp_file.write_text(json.dumps(inline_audio_cache, ensure_ascii=False, indent=2), encoding="utf-8")
+        temp_file.replace(INLINE_CACHE_FILE)
+    except Exception:
+        logger.exception("Не удалось сохранить inline_cache.json")
+
+def cache_track_file_id(key: str | None, file_id: str, title: str, artist: str, duration: int | None = None) -> None:
+    if not key or not file_id:
+        return
+    inline_audio_cache[key] = {
+        "file_id": file_id,
+        "title": title,
+        "artist": artist,
+        "duration": duration,
+        "ts": int(time.time()),
+    }
+    if len(inline_audio_cache) > 3000:
+        oldest = sorted(inline_audio_cache.items(), key=lambda x: x[1].get("ts", 0))[:500]
+        for k, _ in oldest:
+            inline_audio_cache.pop(k, None)
+    save_inline_cache()
+
+def _ensure_ref_record(user_id: int, username: str | None = None) -> dict:
+    key = str(user_id)
+    if key not in referrals_db or not isinstance(referrals_db[key], dict):
+        referrals_db[key] = {"invited": [], "referred_by": None, "username": "", "is_pro": False}
+    if not isinstance(referrals_db[key].get("invited"), list):
+        referrals_db[key]["invited"] = []
+    if "is_pro" not in referrals_db[key]:
+        referrals_db[key]["is_pro"] = False
+    if username:
+        clean_uname = username.lstrip("@").lower()
+        if referrals_db[key].get("username") != clean_uname:
+            referrals_db[key]["username"] = clean_uname
+            save_referrals()
+    return referrals_db[key]
+
+def get_invited_count(user_id: int) -> int:
+    rec = referrals_db.get(str(user_id))
+    if not isinstance(rec, dict):
+        return 0
+    return len(rec.get("invited") or [])
+
+def is_pro_user(user_id: int) -> bool:
+    rec = referrals_db.get(str(user_id))
+    if isinstance(rec, dict) and rec.get("is_pro"):
+        return True
+    return get_invited_count(user_id) >= PRO_REQUIRED_REFS
+
+async def set_manual_pro_async(target: str, status: bool) -> tuple[bool, int | None]:
+    """Выдача или снятие фулл-прав (PRO) по ID или @username (с автопробивом через get_chat)."""
+    clean = target.strip().lstrip("@").lower()
+    if not clean:
+        return False, None
+
+    if clean.isdigit():
+        uid = int(clean)
+        users_db.add(uid)
+        save_users()
+        rec = _ensure_ref_record(uid)
+        rec["is_pro"] = status
+        save_referrals()
+        return True, uid
+
+    for uid_str, data in referrals_db.items():
+        if isinstance(data, dict) and data.get("username", "").lower() == clean:
+            data["is_pro"] = status
+            save_referrals()
+            return True, int(uid_str)
+
+    try:
+        chat = await bot.get_chat(f"@{clean}")
+        if chat and chat.id > 0:
+            uid = int(chat.id)
+            users_db.add(uid)
+            save_users()
+            rec = _ensure_ref_record(uid, username=clean)
+            rec["is_pro"] = status
+            save_referrals()
+            return True, uid
+    except Exception:
+        pass
+
+    return False, None
+
+def get_user_bitrate(user_id: int) -> str:
+    return MP3_BITRATE_PRO if is_pro_user(user_id) else MP3_BITRATE_STD
+
+def get_ref_link(user_id: int) -> str:
+    return f"https://t.me/{BOT_USERNAME}?start=ref_{user_id}"
+
+def get_mp3_caption(user_id: int) -> str:
+    """Подпись под MP3: только кликабельный текст 'Найти песню' со спрятанной реф-ссылкой."""
+    return f'<a href="{get_ref_link(user_id)}">Найти песню</a>'
+
+def register_user(
+    user_id: int,
+    referrer_id: int | None = None,
+    username: str | None = None,
+) -> tuple[bool, int | None]:
+    """Регистрирует юзера. Возвращает (is_new_user, credited_referrer_id)."""
+    is_new = user_id not in users_db
+    credited_referrer = None
+
+    if is_new:
+        users_db.add(user_id)
+        try:
+            save_users()
+        except Exception:
+            logger.exception("Не удалось сохранить базу пользователей")
+
+        user_rec = _ensure_ref_record(user_id, username=username)
+        if (
+            referrer_id
+            and referrer_id != user_id
+            and referrer_id in users_db
+            and user_rec.get("referred_by") is None
+        ):
+            user_rec["referred_by"] = referrer_id
+            inviter_rec = _ensure_ref_record(referrer_id)
+            if user_id not in inviter_rec["invited"]:
+                inviter_rec["invited"].append(user_id)
+                credited_referrer = referrer_id
+            save_referrals()
+        else:
+            save_referrals()
+    else:
+        _ensure_ref_record(user_id, username=username)
+
+    return is_new, credited_referrer
+
+
+# --- FSM СОСТОЯНИЯ ---
+class AdminStates(StatesGroup):
+    mailing_text = State()
+    give_pro_target = State()
+    take_pro_target = State()
+
+class SupportStates(StatesGroup):
+    waiting_for_ticket = State()
+
+class AudioEditStates(StatesGroup):
+    editing = State()
+    waiting_title = State()
+    waiting_artist = State()
+    waiting_cover = State()
+
+
+# --- СЕССИИ РЕДАКТОРА АУДИО (MP3 / WAV / FLAC / OGG -> MP3 С ТЕГАМИ И ОБЛОЖКОЙ) ---
+@dataclass
+class AudioEditSession:
+    user_id: int
+    chat_id: int
+    source_path: Path
+    source_ext: str
+    title: str
+    artist: str
+    duration: int | None = None
+    cover_path: Path | None = None
+    panel_msg_id: int | None = None
+    panel_has_photo: bool = False
+    created_at: float = field(default_factory=time.time)
+
+audio_edit_sessions: dict[int, AudioEditSession] = {}
+
+def cleanup_audio_edit_session(user_id: int) -> None:
+    sess = audio_edit_sessions.pop(user_id, None)
+    if not sess:
+        return
+    for p in (sess.source_path, sess.cover_path):
+        if p and p.exists():
+            try:
+                p.unlink()
+            except OSError:
+                pass
+
+
+# --- ОЧИСТКА ТЕКСТА И ЖЁСТКИЙ ФИЛЬТР ЗАГЛУШЕК (ВКЛЮЧАЯ SOUNDCLOUD МУСОР) ---
+BAD_METADATA_PHRASES = (
+    "собираем музыку для вас",
+    "яндекс музыка",
+    "yandex music",
+    "слушать онлайн на яндекс",
+    "spotify – web player",
+    "spotify - web player",
+    "page not found",
+    "страница не найдена",
+    "just a moment",
+    "access denied",
+    "подтвердите, что запросы отправляли вы",
+    "вы не робот",
+    "smartcaptcha",
+    "sign in to confirm",
+    "вход в аккаунт",
+    "добро пожаловать",
+    "слушать музыку онлайн",
+    "bad browser",
+    "ошибка доступа",
+    "трек не найден",
+    "в apple music",
+    "on apple music",
+    "listen online for free on soundcloud",
+    "discover followers on soundcloud",
+    "stream and listen to music online",
+    "stream music and podcasts",
+    "on desktop and mobile",
+    "звук в формате",
+)
+
+BAD_EXACT_WORDS = {
+    "track", "music", "audio", "song", "песня", "трек", "музыка",
+    "ой!", "ошибка", "error", "404", "403",
+    "вход", "login", "spotify", "deezer", "apple music", "shazam", "soundcloud",
+    "аудиозаписи", "слушать", "слушать онлайн", "моя музыка",
+    "альбом", "album", "плейлист", "playlist", "unknown", "unknown artist",
+    "неизвестен", "неизвестный исполнитель",
+}
+
+def _is_garbage_text(text: str) -> bool:
+    low = (text or "").strip().lower()
+    if not low:
+        return True
+    if not re.search(r"[a-zA-Zа-яА-ЯёЁ0-9]", low):
+        return True
+    if low in BAD_EXACT_WORDS:
+        return True
+    if re.fullmatch(r"user[-_]?\d+", low):
+        return True
+    return any(phrase in low for phrase in BAD_METADATA_PHRASES)
+
+def _clean_text(text: str) -> str:
+    if not text:
+        return ""
+    cleaned = html.unescape(str(text))
+    cleaned = cleaned.replace("\xa0", " ").replace("，", ",").replace("؛", ";")
+    cleaned = re.sub(r"\s*\|\s*Listen online for free on SoundCloud.*$", "", cleaned, flags=re.I)
+    cleaned = re.sub(r"^Stream\s+(.+?)\s+by\s+.+$", r"\1", cleaned, flags=re.I)
+    cleaned = re.sub(r"^Play\s+(.+?)\s+and discover followers on SoundCloud.*$", "", cleaned, flags=re.I)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    cleaned = re.sub(r"\s*,\s*", ", ", cleaned)
+    cleaned = re.sub(r"\s*;\s*", "; ", cleaned)
+    return cleaned.strip(" ,;|•·-")
+
+def _clean_artist(name: str) -> str:
+    if not name:
+        return ""
+    cleaned = html.unescape(str(name))
+    cleaned = re.sub(r"\s*-\s*Topic$", "", cleaned, flags=re.IGNORECASE).strip()
+    cleaned = re.sub(
+        r"\s*(?:Official\s+Artist\s+Channel|Official\s+Channel|Official|VEVO|Music)$",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    ).strip() or cleaned
+    cleaned = re.sub(r"^(?:Альбом|Album|Сингл|Single|EP|Stream|Listen to)\s*[·•:-]?\s*", "", cleaned, flags=re.I).strip()
+    cleaned = re.sub(r"\s+on\s+SoundCloud.*$", "", cleaned, flags=re.I).strip()
+    cleaned = re.sub(r"^Play\s+.+?\s+and discover.*$", "", cleaned, flags=re.I).strip()
+    res = _clean_text(cleaned)
+    return "" if _is_garbage_text(res) else res
+
+def _normalize_track_and_artist(raw_title: str, raw_artist: str) -> tuple[str, str]:
+    title = _clean_text(raw_title)
+    artist = _clean_artist(raw_artist)
+
+    title = re.sub(r"\s*[\(\[](?:Official\s+(?:Audio|Video|Music\s+Video|Lyric\s+Video)|Lyrics?|Audio|HD|HQ|4K)[\)\]]\s*$", "", title, flags=re.I).strip()
+
+    split_art, split_tit = _split_artist_title(title)
+    if split_art and split_tit:
+        title = split_tit
+        if not artist or _norm_key(split_art) != _norm_key(artist):
+            artist = split_art
+
+    if _is_garbage_text(artist):
+        artist = ""
+    if _is_garbage_text(title):
+        title = "Track"
+
+    return title, artist
+
+def _clean_apple_title(raw_title: str) -> tuple[str, str]:
+    s = _clean_text(raw_title)
+    s = re.sub(r"\s+(?:в|on|in)\s+Apple\s*Music.*$", "", s, flags=re.I).strip()
+    s = re.sub(r"\s*\|\s*Apple\s*Music.*$", "", s, flags=re.I).strip()
+
+    m_ru = re.search(r"^(?:Альбом|Песня|Сингл|Трек)\s+[«\"](.+?)[»\"]\s*\((.+?)\)", s, re.I)
+    if m_ru:
+        return _clean_artist(m_ru.group(2)), _clean_text(m_ru.group(1))
+
+    m_ru2 = re.search(r"^[«\"](.+?)[»\"]\s*[—–-]\s*(?:песня|альбом|сингл)?\s*(?:исполнителя\s+)?(.+)$", s, re.I)
+    if m_ru2:
+        return _clean_artist(m_ru2.group(2)), _clean_text(m_ru2.group(1))
+
+    m_en = re.search(r"^(.+?)\s*(?:-\s*(?:Album|Single|EP|Song)\s+)?by\s+(.+)$", s, re.I)
+    if m_en:
+        return _clean_artist(m_en.group(2)), _clean_text(m_en.group(1))
+
+    s = re.sub(r"^(?:Альбом|Песня|Сингл|Трек|Album|Song|Single)\s+", "", s, flags=re.I).strip(" «»\"'")
+    return _split_artist_title(s)
+
+def _norm_key(text: str) -> str:
+    s = (text or "").lower().replace("ё", "е")
+    return re.sub(r"[^\wа-яa-z0-9]+", "", s)
+
+def format_duration(seconds: int | None) -> str:
+    if not seconds or seconds <= 0:
+        return ""
+    m, s = divmod(int(seconds), 60)
+    h, m = divmod(m, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+# --- РАСПОЗНАВАНИЕ ССЫЛОК ПЛОЩАДОК (БЕЗ ВК) ---
+PLATFORM_DOMAINS: dict[str, tuple[str, ...]] = {
+    "youtube": ("youtube.com", "youtu.be", "youtube-nocookie.com", "music.youtube.com"),
+    "soundcloud": ("soundcloud.com", "on.soundcloud.com", "soundcloud.app.goo.gl"),
+    "spotify": ("spotify.com", "spotify.link", "spoti.fi"),
+    "yandex": ("music.yandex.ru", "music.yandex.com", "music.yandex.by", "music.yandex.kz", "music.yandex.uz"),
+    "apple": ("music.apple.com", "itunes.apple.com"),
+    "deezer": ("deezer.com", "deezer.page.link"),
+    "shazam": ("shazam.com",),
+    "tiktok": ("tiktok.com", "vm.tiktok.com", "vt.tiktok.com"),
+    "instagram": ("instagram.com", "instagr.am"),
+    "bandcamp": ("bandcamp.com",),
+    "mixcloud": ("mixcloud.com",),
+    "audiomack": ("audiomack.com",),
+    "tidal": ("tidal.com",),
+    "zvuk": ("zvuk.com", "sber-zvuk.com"),
+    "mts": ("music.mts.ru",),
+    "rutube": ("rutube.ru",),
+    "twitter": ("twitter.com", "x.com", "t.co"),
+    "reddit": ("reddit.com", "redd.it"),
+    "twitch": ("twitch.tv",),
+    "pinterest": ("pinterest.com", "pin.it"),
+    "bilibili": ("bilibili.com", "b23.tv"),
+}
+
+VK_DOMAINS = ("vk.com", "vk.ru", "m.vk.com", "vkvideo.ru")
+
+METADATA_FIRST_PLATFORMS = {"spotify", "yandex", "apple", "deezer", "shazam", "tidal", "zvuk", "mts"}
+
+SHORT_LINK_HOSTS = {
+    "on.soundcloud.com", "soundcloud.app.goo.gl", "goo.gl",
+    "vm.tiktok.com", "vt.tiktok.com", "spotify.link", "spoti.fi",
+    "deezer.page.link", "t.co", "bit.ly", "clck.ru",
+    "pin.it", "redd.it", "b23.tv", "tinyurl.com", "is.gd",
+}
+
+URL_RE = re.compile(r'(?:https?://)?(?:[a-z0-9-]+\.)+[a-z]{2,}(?:[/?#][^\s<>"\']*)?', re.IGNORECASE)
+
+def _host_in(host: str, domains: tuple[str, ...] | set[str]) -> bool:
+    return any(host == d or host.endswith("." + d) for d in domains)
+
+def _is_safe_public_host(host: str) -> bool:
+    if not host or "." not in host or host.endswith(".local"):
+        return False
+    if host in ("localhost", "127.0.0.1", "0.0.0.0"):
+        return False
+    try:
+        ip = ipaddress.ip_address(host)
+        return not (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved)
+    except ValueError:
+        return True
+
+def is_vk_url(text: str) -> bool:
+    for raw in URL_RE.findall(text or ""):
+        u = raw if re.match(r"^https?://", raw, re.I) else f"https://{raw}"
+        try:
+            host = (urlparse(u).hostname or "").lower()
+            if _host_in(host, VK_DOMAINS):
+                return True
+        except Exception:
+            pass
+    return False
+
+def detect_platform_by_url(url: str) -> str:
+    try:
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower()
+        path = (parsed.path or "").lower()
+    except ValueError:
+        return "web"
+
+    for platform, domains in PLATFORM_DOMAINS.items():
+        if _host_in(host, domains):
+            return platform
+    if _host_in(host, ("yandex.ru", "yandex.com", "yandex.by", "yandex.kz")) and "/music" in path:
+        return "yandex"
+    return "web"
+
+def classify_url(raw: str) -> tuple[str, str] | None:
+    url = (raw or "").strip().strip("<>\"'").rstrip(".,!?;:)]}>»…")
+    if not url:
+        return None
+    if not re.match(r"^https?://", url, re.IGNORECASE):
+        if "/" not in url and "?" not in url:
+            return None
+        url = "https://" + url
+    try:
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower()
+    except ValueError:
+        return None
+    if not _is_safe_public_host(host) or _host_in(host, VK_DOMAINS):
+        return None
+    platform = detect_platform_by_url(url)
+    if platform != "web" and parsed.path in ("", "/") and not parsed.query:
+        return None
+    return url, platform
+
+def find_supported_url(candidates: list[str]) -> tuple[str | None, str | None]:
+    for raw in candidates:
+        result = classify_url(raw)
+        if result:
+            return result
+    return None, None
+
+def collect_candidate_urls(message: types.Message) -> list[str]:
+    candidates: list[str] = []
+    for text, entities in ((message.text, message.entities), (message.caption, message.caption_entities)):
+        if not text:
+            continue
+        for ent in entities or []:
+            try:
+                if ent.type == "text_link" and ent.url:
+                    candidates.append(ent.url)
+                elif ent.type == "url":
+                    candidates.append(ent.extract_from(text))
+            except Exception:
+                pass
+        candidates.extend(URL_RE.findall(text))
+    return candidates
+
+def _build_opener() -> urllib.request.OpenerDirector:
+    cookie_jar = http.cookiejar.CookieJar()
+    handlers: list[urllib.request.BaseHandler] = [urllib.request.HTTPCookieProcessor(cookie_jar)]
+    if YTDLP_PROXY:
+        handlers.append(urllib.request.ProxyHandler({"http": YTDLP_PROXY, "https": YTDLP_PROXY}))
+    return urllib.request.build_opener(*handlers)
+
+def _decode_bytes(raw: bytes, content_type: str = "") -> str:
+    if not raw:
+        return ""
+    ct_low = (content_type or "").lower()
+    if "windows-1251" in ct_low or "cp1251" in ct_low:
+        return raw.decode("cp1251", errors="ignore")
+    head_ascii = raw[:4096].decode("latin-1", errors="ignore").lower()
+    if "windows-1251" in head_ascii or "cp1251" in head_ascii:
+        return raw.decode("cp1251", errors="ignore")
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw.decode("cp1251", errors="ignore")
+
+def _http_get_text(
+    url: str,
+    extra_headers: dict[str, str] | None = None,
+    max_bytes: int = 2 * 1024 * 1024,
+    timeout: int = 12,
+    user_agent: str | None = None,
+    post_data: bytes | None = None,
+) -> tuple[str, str]:
+    headers = {
+        "User-Agent": user_agent or USER_AGENT,
+        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+    }
+    if extra_headers:
+        headers.update(extra_headers)
+    req = urllib.request.Request(url, data=post_data, headers=headers)
+    with _build_opener().open(req, timeout=timeout) as resp:
+        final_url = resp.geturl()
+        ctype = resp.headers.get("Content-Type", "")
+        data = resp.read(max_bytes)
+    return final_url, _decode_bytes(data, ctype)
+
+def resolve_short_url(url: str) -> str:
+    try:
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower()
+        if not _host_in(host, SHORT_LINK_HOSTS):
+            return url
+        final_url, _ = _http_get_text(url, max_bytes=4096, timeout=10)
+        if classify_url(final_url):
+            return final_url
+    except Exception:
+        logger.warning("Не удалось раскрыть короткую ссылку %s", url, exc_info=True)
+    return url
+
+def extract_youtube_id(url: str) -> str | None:
+    try:
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower()
+        path = parsed.path or ""
+        query = parse_qs(parsed.query)
+        video_id = None
+        if host == "youtu.be":
+            video_id = path.strip("/").split("/")[0]
+        elif path == "/watch":
+            video_id = (query.get("v") or [None])[0]
+        else:
+            m = re.match(r"^/(?:shorts|live|embed|v)/([\w-]{11})", path)
+            if m:
+                video_id = m.group(1)
+        if video_id and re.fullmatch(r"[\w-]{11}", video_id):
+            return video_id
+    except Exception:
+        pass
+    return None
+
+def canonical_youtube_url(url: str) -> str:
+    vid = extract_youtube_id(url)
+    return f"https://www.youtube.com/watch?v={vid}" if vid else url
+
+
+# --- МОДЕЛЬ МЕТАДАННЫХ И СТРИМИНГОВЫЕ ПАРСЕРЫ ---
+@dataclass
+class MetadataHint:
+    title: str
+    artist: str = ""
+    duration: int | None = None
+    thumbnail_url: str | None = None
+    direct_urls: list[str] = field(default_factory=list)
+    method: str = ""
+
+    @property
+    def search_query(self) -> str:
+        t = _clean_text(self.title)
+        a = _clean_artist(self.artist)
+        if a and a.lower() not in t.lower():
+            return f"{a} - {t}"
+        return t
+
+
+def _split_artist_title(raw: str) -> tuple[str, str]:
+    cleaned = _clean_text(raw)
+    for sep in (" — ", " – ", " - ", " | "):
+        if sep in cleaned:
+            parts = [p.strip() for p in cleaned.split(sep, 1)]
+            if len(parts) == 2 and parts[0] and parts[1]:
+                art = _clean_artist(parts[0])
+                tit = _clean_text(parts[1])
+                if art and tit and not _is_garbage_text(tit):
+                    return art, tit
+    return "", cleaned
+
+def _extract_meta_tag(html_text: str, prop: str) -> str | None:
+    patterns = [
+        rf'<meta[^>]+(?:property|name)=["\']{re.escape(prop)}["\'][^>]+content=["\']([^"\']+)["\']',
+        rf'<meta[^>]+content=["\']([^"\']+)["\'][^>]+(?:property|name)=["\']{re.escape(prop)}["\']',
+    ]
+    for pat in patterns:
+        m = re.search(pat, html_text, re.IGNORECASE)
+        if m:
+            val = html.unescape(m.group(1)).strip()
+            if val:
+                return val
+    return None
+
+def _extract_odesli_metadata(url: str) -> MetadataHint | None:
+    try:
+        api_url = f"https://api.song.link/v1-alpha.1/links?url={urllib.parse.quote(url, safe='')}&userCountry=RU"
+        _, text = _http_get_text(api_url, timeout=10)
+        data = json.loads(text)
+        entities = data.get("entitiesByUniqueId") or {}
+        links_by_platform = data.get("linksByPlatform") or {}
+
+        direct_urls: list[str] = []
+        for plat in ("youtube", "youtubeMusic", "soundcloud"):
+            plat_obj = links_by_platform.get(plat)
+            if isinstance(plat_obj, dict) and plat_obj.get("url"):
+                u = plat_obj["url"]
+                if plat in ("youtube", "youtubeMusic"):
+                    u = canonical_youtube_url(u)
+                if u not in direct_urls:
+                    direct_urls.append(u)
+
+        primary_id = data.get("entityUniqueId")
+        ordered_entities = []
+        if primary_id and primary_id in entities:
+            ordered_entities.append(entities[primary_id])
+        ordered_entities.extend(v for k, v in entities.items() if k != primary_id and isinstance(v, dict))
+
+        for ent in ordered_entities:
+            if ent.get("type") == "album":
+                continue
+            title = _clean_text(ent.get("title") or "")
+            artist = _clean_artist(ent.get("artistName") or "")
+            thumb = ent.get("thumbnailUrl")
+            if title and not _is_garbage_text(title):
+                return MetadataHint(title=title, artist=artist, thumbnail_url=thumb, direct_urls=direct_urls)
+    except Exception:
+        logger.debug("Odesli не сработал для %s", url, exc_info=True)
+    return None
+
+def _search_deezer_catalog(query: str, limit: int = 8) -> list[MetadataHint]:
+    results: list[MetadataHint] = []
+    if not query or _is_garbage_text(query):
+        return results
+    try:
+        api_url = f"https://api.deezer.com/search?q={urllib.parse.quote(query)}&limit={limit}"
+        _, text = _http_get_text(api_url, timeout=8)
+        data = json.loads(text)
+        for item in (data.get("data") or []):
+            if not isinstance(item, dict) or not item.get("title"):
+                continue
+            title = _clean_text(item["title"])
+            artist = _clean_artist((item.get("artist") or {}).get("name") or "")
+            dur = int(item["duration"]) if item.get("duration") else None
+            album = item.get("album") or {}
+            thumb = album.get("cover_xl") or album.get("cover_big") or album.get("cover_medium")
+            if title and not _is_garbage_text(title):
+                results.append(MetadataHint(title=title, artist=artist, duration=dur, thumbnail_url=thumb))
+    except Exception:
+        logger.debug("Ошибка поиска в каталоге Deezer: %s", query, exc_info=True)
+    return results
+
+def _search_deezer_album_tracks(artist: str, album_title: str) -> list[MetadataHint]:
+    q = f"{artist} {album_title}".strip()
+    if not q:
+        return []
+    try:
+        api_url = f"https://api.deezer.com/search/album?q={urllib.parse.quote(q)}&limit=5"
+        _, text = _http_get_text(api_url, timeout=8)
+        data = json.loads(text)
+        albums = data.get("data") or []
+        alb_norm = _norm_key(album_title)
+        art_norm = _norm_key(artist)
+        chosen_id = None
+        chosen_thumb = None
+        chosen_artist = artist
+
+        for a in albums:
+            if not isinstance(a, dict) or not a.get("id"):
+                continue
+            cand_title = _norm_key(a.get("title") or "")
+            cand_art = _norm_key((a.get("artist") or {}).get("name") or "")
+            if (alb_norm in cand_title or cand_title in alb_norm) and (not art_norm or art_norm in cand_art or cand_art in art_norm):
+                chosen_id = a["id"]
+                chosen_thumb = a.get("cover_xl") or a.get("cover_big") or a.get("cover_medium")
+                chosen_artist = _clean_artist((a.get("artist") or {}).get("name") or artist)
+                break
+        if not chosen_id and albums and isinstance(albums[0], dict):
+            chosen_id = albums[0].get("id")
+            chosen_thumb = albums[0].get("cover_xl") or albums[0].get("cover_big")
+            chosen_artist = _clean_artist((albums[0].get("artist") or {}).get("name") or artist)
+
+        if chosen_id:
+            _, tr_text = _http_get_text(f"https://api.deezer.com/album/{chosen_id}/tracks?limit=50", timeout=8)
+            tr_data = json.loads(tr_text)
+            tracks: list[MetadataHint] = []
+            for item in (tr_data.get("data") or []):
+                if not isinstance(item, dict) or not item.get("title"):
+                    continue
+                t_title = _clean_text(item["title"])
+                t_art = _clean_artist((item.get("artist") or {}).get("name") or chosen_artist)
+                dur = int(item["duration"]) if item.get("duration") else None
+                if t_title and not _is_garbage_text(t_title):
+                    tracks.append(MetadataHint(title=t_title, artist=t_art, duration=dur, thumbnail_url=chosen_thumb))
+            return tracks
+    except Exception:
+        logger.debug("Ошибка поиска альбома в Deezer: %s", q, exc_info=True)
+    return []
+
+def _search_itunes_catalog(query: str, limit: int = 8, country: str = "RU") -> list[MetadataHint]:
+    results: list[MetadataHint] = []
+    if not query or _is_garbage_text(query):
+        return results
+    try:
+        api_url = (
+            f"https://itunes.apple.com/search?term={urllib.parse.quote(query)}"
+            f"&media=music&entity=song&limit={limit}&country={country}"
+        )
+        _, text = _http_get_text(api_url, timeout=8)
+        data = json.loads(text)
+        for item in (data.get("results") or []):
+            if not isinstance(item, dict) or not item.get("trackName"):
+                continue
+            title = _clean_text(item["trackName"])
+            artist = _clean_artist(item.get("artistName") or "")
+            dur_ms = item.get("trackTimeMillis")
+            dur = int(round(dur_ms / 1000)) if isinstance(dur_ms, (int, float)) and dur_ms > 0 else None
+            thumb = item.get("artworkUrl100")
+            if thumb:
+                thumb = re.sub(r"\d+x\d+bb", "600x600bb", thumb)
+            if title and not _is_garbage_text(title):
+                results.append(MetadataHint(title=title, artist=artist, duration=dur, thumbnail_url=thumb))
+    except Exception:
+        logger.debug("Ошибка поиска в каталоге iTunes: %s", query, exc_info=True)
+    return results
+
+def _enrich_hint_from_catalogs(hint: MetadataHint) -> MetadataHint:
+    if not hint.title or not hint.artist:
+        return hint
+    if hint.duration and hint.thumbnail_url:
+        return hint
+
+    query = hint.search_query
+    candidates = _search_deezer_catalog(query, limit=5) or _search_itunes_catalog(query, limit=5, country="RU")
+    if not candidates:
+        return hint
+
+    t_norm = _norm_key(hint.title)
+    a_norm = _norm_key(hint.artist)
+    for c in candidates:
+        ct_norm = _norm_key(c.title)
+        ca_norm = _norm_key(c.artist)
+        if not ct_norm or not ca_norm:
+            continue
+        title_match = (ct_norm == t_norm or t_norm in ct_norm or ct_norm in t_norm)
+        artist_match = (ca_norm == a_norm or a_norm in ca_norm or ca_norm in a_norm)
+        if title_match and artist_match:
+            if not hint.duration and c.duration:
+                hint.duration = c.duration
+            if not hint.thumbnail_url and c.thumbnail_url:
+                hint.thumbnail_url = c.thumbnail_url
+            break
+    return hint
+
+
+# ==============================================================================
+# 🎤 СУПЕР-УМНОЕ РАСПОЗНАВАНИЕ МУЗЫКИ, РИТМА И НАПЕВАНИЯ (SHAZAM + AI + STT)
+# ==============================================================================
+def _prepare_recognition_clips(media_path: Path, base_tag: str) -> list[tuple[str, Path]]:
+    """
+    Генерирует 4 специальных аудио-среза через FFmpeg для максимального шанса распознавания:
+    1. Чистый центральный срез (оригинал).
+    2. Изоляция вокала и мелодии (Highpass 200Hz + Lowpass 4200Hz + компрессия динамики).
+    3. Анти-SpeedUp (замедление 0.84x для распознавания ускоренных TikTok-ремиксов).
+    4. Анти-Slowed (ускорение 1.18x для распознавания slowed + reverb версий).
+    """
+    clips: list[tuple[str, Path]] = []
+    if not shutil.which("ffmpeg"):
+        return [("original", media_path)]
+
+    # Узнаем длительность, чтобы брать сочную середину трека/видео, а не пустое интро
+    _, _, dur, _ = probe_audio_metadata(media_path)
+    start_sec = 0
+    if dur and dur > 18:
+        start_sec = min(int(dur * 0.25), 30)
+
+    configs = [
+        ("Shazam (Точный сигнал)", "anull", f"{base_tag}_std.wav"),
+        ("Shazam (Выделение мелодии/голоса)", "highpass=f=200,lowpass=f=4200,dynaudnorm", f"{base_tag}_mel.wav"),
+        ("Shazam (Анти-SpeedUp 0.84x)", "asetrate=16000*0.84,aresample=16000,dynaudnorm", f"{base_tag}_desped.wav"),
+        ("Shazam (Анти-Slowed 1.18x)", "asetrate=16000*1.18,aresample=16000,dynaudnorm", f"{base_tag}_deslow.wav"),
+    ]
+
+    for label, af_filter, fname in configs:
+        out_p = DOWNLOAD_DIR / fname
+        cmd = [
+            "ffmpeg", "-y",
+            "-ss", str(start_sec),
+            "-t", "14",
+            "-i", str(media_path),
+            "-vn", "-ac", "1", "-ar", "16000",
+            "-af", af_filter,
+            str(out_p),
+        ]
+        try:
+            subprocess.run(cmd, capture_output=True, timeout=15)
+            if out_p.exists() and out_p.stat().st_size > 1000:
+                clips.append((label, out_p))
+        except Exception:
+            pass
+
+    if not clips:
+        clips.append(("Shazam", media_path))
+    return clips
+
+def _recognize_lyrics_via_stt(wav_path: Path) -> str:
+    """Распознает напетые слова (RU + EN) из голосового/аудио через Google Speech Recognition."""
+    recognizer = sr.Recognizer()
+    try:
+        with sr.AudioFile(str(wav_path)) as source:
+            audio_data = recognizer.record(source, duration=14)
+        for lang in ("ru-RU", "en-US"):
+            try:
+                text = recognizer.recognize_google(audio_data, language=lang)
+                cleaned = _clean_text(text)
+                if len(cleaned) >= 4:
+                    return cleaned
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return ""
+
+def _recognize_humming_via_acrcloud(wav_path: Path) -> MetadataHint | None:
+    """Распознавание напевания (Humming) через ACRCloud, если заданы ключи ACR_*."""
+    if not (ACR_HOST and ACR_ACCESS_KEY and ACR_SECRET_KEY):
+        return None
+    try:
+        http_method = "POST"
+        http_uri = "/v1/identify"
+        data_type = "audio"
+        signature_version = "1"
+        timestamp = str(int(time.time()))
+        string_to_sign = f"{http_method}\n{http_uri}\n{ACR_ACCESS_KEY}\n{data_type}\n{signature_version}\n{timestamp}"
+        sign = base64.b64encode(
+            hmac.new(ACR_SECRET_KEY.encode("utf-8"), string_to_sign.encode("utf-8"), digestmod=hashlib.sha1).digest()
+        ).decode("utf-8")
+
+        sample_bytes = wav_path.read_bytes()
+        boundary = f"----BotBoundary{uuid.uuid4().hex}"
+        fields = {
+            "access_key": ACR_ACCESS_KEY,
+            "sample_bytes": str(len(sample_bytes)),
+            "timestamp": timestamp,
+            "signature": sign,
+            "data_type": data_type,
+            "signature_version": signature_version,
+        }
+        body = bytearray()
+        for k, v in fields.items():
+            body.extend(f"--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n".encode("utf-8"))
+        body.extend(
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"sample\"; filename=\"sample.wav\"\r\nContent-Type: application/octet-stream\r\n\r\n".encode("utf-8")
+        )
+        body.extend(sample_bytes)
+        body.extend(f"\r\n--{boundary}--\r\n".encode("utf-8"))
+
+        url = f"https://{ACR_HOST}{http_uri}"
+        _, resp_text = _http_get_text(
+            url,
+            extra_headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+            post_data=bytes(body),
+            timeout=12,
+        )
+        data = json.loads(resp_text)
+        meta = data.get("metadata") or {}
+        music_list = meta.get("humming") or meta.get("music") or []
+        if music_list and isinstance(music_list[0], dict):
+            top = music_list[0]
+            title = _clean_text(top.get("title") or "")
+            artists = top.get("artists") or []
+            artist = _clean_artist(artists[0].get("name") or "") if artists else ""
+            if title:
+                return _enrich_hint_from_catalogs(MetadataHint(title=title, artist=artist, method="Humming AI (Напев/Мелодия)"))
+    except Exception:
+        logger.debug("Ошибка ACRCloud Humming", exc_info=True)
+    return None
+
+def _recognize_melody_via_gemini(wav_path: Path) -> MetadataHint | None:
+    """Мультимодальное ИИ-распознавание напева, прогрессии, ритма или слов через Gemini API (если задан GEMINI_API_KEY)."""
+    if not GEMINI_API_KEY:
+        return None
+    try:
+        b64_audio = base64.b64encode(wav_path.read_bytes()).decode("ascii")
+        api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
+        payload = {
+            "contents": [{
+                "parts": [
+                    {
+                        "text": (
+                            "Listen carefully to this audio clip. It may be a song recording, a sped-up/slowed remix, "
+                            "or a person humming, singing, whistling, or beatboxing a melody/rhythm. "
+                            "Identify the most likely song and return ONLY valid JSON: "
+                            "{\"artist\": \"Artist Name\", \"title\": \"Song Title\"}. "
+                            "If completely unrecognizable, return {\"artist\": \"\", \"title\": \"\"}."
+                        )
+                    },
+                    {"inline_data": {"mime_type": "audio/wav", "data": b64_audio}},
+                ]
+            }]
+        }
+        _, resp_text = _http_get_text(
+            api_url,
+            extra_headers={"Content-Type": "application/json"},
+            post_data=json.dumps(payload).encode("utf-8"),
+            timeout=15,
+        )
+        resp_json = json.loads(resp_text)
+        cand_text = (
+            resp_json.get("candidates", [{}])[0]
+            .get("content", {})
+            .get("parts", [{}])[0]
+            .get("text", "")
+        )
+        m = re.search(r"\{.*?\}", cand_text, re.S)
+        if m:
+            parsed = json.loads(m.group(0))
+            t = _clean_text(parsed.get("title") or "")
+            a = _clean_artist(parsed.get("artist") or "")
+            if t and not _is_garbage_text(t):
+                return _enrich_hint_from_catalogs(MetadataHint(title=t, artist=a, method="AI Melody & Rhythm"))
+    except Exception:
+        logger.debug("Ошибка Gemini Audio Recognition", exc_info=True)
+    return None
+
+async def recognize_audio_smart(media_path: Path) -> tuple[MetadataHint | None, list[dict], str]:
+    """
+    Главная функция распознавания песни по видео, аудио или голосовому (включая напевание/ритм/speedup).
+    Возвращает: (точный_хинт, список_похожих_треков, распознанная_фраза).
+    """
+    base_tag = f"shz_{uuid.uuid4().hex[:8]}"
+    clips = await asyncio.to_thread(_prepare_recognition_clips, media_path, base_tag)
+
+    try:
+        # 1. Прогоняем все 4 сигнатуры через Shazam (оригинал, вокал/мелодия, анти-speedup, анти-slowed)
+        for method_label, clip_path in clips:
+            try:
+                res = await shazam_client.recognize(str(clip_path))
+                track = (res or {}).get("track")
+                if isinstance(track, dict) and track.get("title"):
+                    raw_t = _clean_text(track.get("title") or "")
+                    raw_a = _clean_artist(track.get("subtitle") or "")
+                    images = track.get("images") or {}
+                    cover = images.get("coverarthq") or images.get("coverart") or images.get("background")
+                    if raw_t and not _is_garbage_text(raw_t):
+                        hint = MetadataHint(title=raw_t, artist=raw_a, thumbnail_url=cover, method=method_label)
+                        hint = await asyncio.to_thread(_enrich_hint_from_catalogs, hint)
+                        return hint, [], ""
+            except Exception:
+                logger.debug("Попытка Shazam (%s) не дала результата", method_label)
+
+        # Берём вокально-мелодический срез для Humming AI и распознавания напетых слов
+        mel_clip = clips[1][1] if len(clips) > 1 else clips[0][1]
+
+        # 2. Пробуем ACRCloud Humming (если подключен)
+        acr_hint = await asyncio.to_thread(_recognize_humming_via_acrcloud, mel_clip)
+        if acr_hint:
+            return acr_hint, [], ""
+
+        # 3. Пробуем мультимодальный ИИ-слух Gemini (мелодия, прогрессия, мычание, бит)
+        ai_hint = await asyncio.to_thread(_recognize_melody_via_gemini, mel_clip)
+        if ai_hint:
+            return ai_hint, [], ""
+
+        # 4. Распознаём напетые слова/строчки через Speech-to-Text (RU / EN) и ищем трек по тексту
+        sung_words = await asyncio.to_thread(_recognize_lyrics_via_stt, mel_clip)
+        if sung_words:
+            # Сначала ищем точное совпадение в музыкальных каталогах Deezer / iTunes
+            catalog_hits = await asyncio.to_thread(_search_deezer_catalog, sung_words, 5)
+            if not catalog_hits:
+                catalog_hits = await asyncio.to_thread(_search_itunes_catalog, sung_words, 5, "RU")
+
+            yt_candidates = await asyncio.to_thread(ytdlp_search_tracks, f"{sung_words} песня трек", 12)
+            if catalog_hits:
+                best = catalog_hits[0]
+                best.method = f"По напетым словам («{sung_words}»)"
+                return best, yt_candidates, sung_words
+            if yt_candidates:
+                top_yt = yt_candidates[0]
+                hint = MetadataHint(
+                    title=top_yt.get("title") or "Трек",
+                    artist=top_yt.get("uploader") or "",
+                    duration=top_yt.get("duration"),
+                    direct_urls=[top_yt["url"]],
+                    method=f"По напетым словам («{sung_words}»)",
+                )
+                return hint, yt_candidates, sung_words
+
+        return None, [], ""
+    finally:
+        for _, cp in clips:
+            if cp != media_path and cp.exists():
+                try:
+                    cp.unlink()
+                except OSError:
+                    pass
+
+
+# --- ИЗВЛЕЧЕНИЕ МЕТАДАННЫХ ИЗ СООБЩЕНИЯ ИЛИ ПРЕВЬЮ TELEGRAM ---
+def extract_message_context_hint(message: types.Message, clean_url: str) -> MetadataHint | None:
+    raw_msg = (message.text or message.caption or "").strip()
+    if raw_msg:
+        text_without_urls = URL_RE.sub(" ", raw_msg).strip(" \n\r\t—–-|•·,.")
+        if text_without_urls and len(text_without_urls) >= 2 and not _is_garbage_text(text_without_urls):
+            art, tit = _split_artist_title(text_without_urls)
+            if art and tit:
+                return MetadataHint(title=tit, artist=art)
+            return MetadataHint(title=_clean_text(text_without_urls))
+    return None
+
+
+# --- ПАРСИНГ АЛЬБОМОВ И ТРЕКОВ (APPLE MUSIC, SPOTIFY, ЯНДЕКС, DEEZER) ---
+def is_album_or_playlist_url(url: str, platform: str) -> bool:
+    parsed = urlparse(url)
+    path = (parsed.path or "").lower()
+    query = parse_qs(parsed.query)
+    if platform == "yandex":
+        return "/album/" in path and "/track/" not in path
+    if platform == "spotify":
+        return "/album/" in path or "/playlist/" in path
+    if platform == "apple":
+        return ("/album/" in path and "i=" not in parsed.query) or "/playlist/" in path
+    if platform == "deezer":
+        return "/album/" in path or "/playlist/" in path
+    if platform == "soundcloud":
+        return "/sets/" in path
+    if platform == "youtube":
+        return "list" in query and "/watch" not in path
+    return False
+
+def extract_album_tracks(url: str, platform: str) -> tuple[str, list[MetadataHint]]:
+    parsed = urlparse(url)
+    path = parsed.path or ""
+
+    if platform == "deezer":
+        m = re.search(r"/(album|playlist)/(\d+)", path)
+        if m:
+            kind, item_id = m.group(1), m.group(2)
+            try:
+                _, text = _http_get_text(f"https://api.deezer.com/{kind}/{item_id}", timeout=10)
+                data = json.loads(text)
+                alb_title = _clean_text(data.get("title") or "Альбом")
+                cover = data.get("cover_xl") or data.get("cover_big") or data.get("picture_xl")
+                tracks_raw = (data.get("tracks") or {}).get("data") or []
+                tracks: list[MetadataHint] = []
+                for tr in tracks_raw[:50]:
+                    t_title = _clean_text(tr.get("title") or "")
+                    t_art = _clean_artist((tr.get("artist") or {}).get("name") or "")
+                    dur = int(tr["duration"]) if tr.get("duration") else None
+                    if t_title:
+                        tracks.append(MetadataHint(title=t_title, artist=t_art, duration=dur, thumbnail_url=cover))
+                if tracks:
+                    return alb_title, tracks
+            except Exception:
+                logger.debug("Не удалось распарсить альбом Deezer %s", url, exc_info=True)
+
+    if platform == "apple":
+        m = re.search(r"/album/[^/]+/(\d+)", path) or re.search(r"/album/(\d+)", path)
+        if m:
+            collection_id = m.group(1)
+            try:
+                _, text = _http_get_text(
+                    f"https://itunes.apple.com/lookup?id={collection_id}&entity=song&country=RU",
+                    timeout=10,
+                )
+                data = json.loads(text)
+                results = data.get("results") or []
+                alb_title = "Альбом"
+                tracks = []
+                for item in results:
+                    if item.get("wrapperType") == "collection":
+                        alb_title = _clean_text(item.get("collectionName") or alb_title)
+                    elif item.get("wrapperType") == "track" and item.get("trackName"):
+                        t_title = _clean_text(item["trackName"])
+                        t_art = _clean_artist(item.get("artistName") or "")
+                        dur_ms = item.get("trackTimeMillis")
+                        dur = int(round(dur_ms / 1000)) if isinstance(dur_ms, (int, float)) else None
+                        thumb = item.get("artworkUrl100")
+                        if thumb:
+                            thumb = re.sub(r"\d+x\d+bb", "600x600bb", thumb)
+                        tracks.append(MetadataHint(title=t_title, artist=t_art, duration=dur, thumbnail_url=thumb))
+                if tracks:
+                    return alb_title, tracks
+            except Exception:
+                logger.debug("Не удалось распарсить альбом Apple Music %s", url, exc_info=True)
+
+    if platform == "yandex":
+        m = re.search(r"/album/(\d+)", path)
+        if m:
+            alb_id = m.group(1)
+            try:
+                api_url = f"https://music.yandex.ru/handlers/album.jsx?album={alb_id}"
+                _, text = _http_get_text(api_url, timeout=10, user_agent=BOT_USER_AGENT)
+                data = json.loads(text)
+                alb_title = _clean_text(data.get("title") or "Альбом")
+                alb_art = _clean_artist(", ".join(a.get("name", "") for a in (data.get("artists") or []) if a.get("name")))
+                cover_uri = data.get("coverUri")
+                cover = f"https://{cover_uri.replace('%%', '400x400')}" if cover_uri else None
+                tracks = []
+                for vol in (data.get("volumes") or []):
+                    for tr in vol:
+                        t_title = _clean_text(tr.get("title") or "")
+                        t_art = _clean_artist(", ".join(a.get("name", "") for a in (tr.get("artists") or []) if a.get("name"))) or alb_art
+                        dur_ms = tr.get("durationMs")
+                        dur = int(round(dur_ms / 1000)) if isinstance(dur_ms, (int, float)) else None
+                        if t_title:
+                            tracks.append(MetadataHint(title=t_title, artist=t_art, duration=dur, thumbnail_url=cover))
+                if tracks:
+                    return alb_title, tracks[:50]
+            except Exception:
+                logger.debug("Ошибка парсинга альбома Яндекс Музыки %s", url, exc_info=True)
+
+    try:
+        _, html_text = _http_get_text(url, timeout=10, user_agent=BOT_USER_AGENT)
+        og_title = _extract_meta_tag(html_text, "og:title") or ""
+        art, alb_title = _clean_apple_title(og_title) if platform == "apple" else _split_artist_title(og_title)
+        if alb_title and not _is_garbage_text(alb_title):
+            deezer_tracks = _search_deezer_album_tracks(art, alb_title)
+            if deezer_tracks:
+                return alb_title, deezer_tracks
+    except Exception:
+        pass
+
+    return "", []
+
+def extract_metadata_hint(url: str, platform: str) -> MetadataHint | None:
+    if platform not in METADATA_FIRST_PLATFORMS:
+        return None
+
+    parsed = urlparse(url)
+    path = parsed.path or ""
+    query = parse_qs(parsed.query)
+
+    if platform == "yandex":
+        m = re.search(r"/track/(\d+)", path)
+        if m:
+            track_id = m.group(1)
+            try:
+                api_url = f"https://music.yandex.ru/handlers/track.jsx?track={track_id}"
+                _, text = _http_get_text(api_url, timeout=8, user_agent=BOT_USER_AGENT)
+                data = json.loads(text).get("track") or {}
+                title = _clean_text(data.get("title") or "")
+                version = _clean_text(data.get("version") or "")
+                if version and version.lower() not in title.lower():
+                    title = f"{title} ({version})"
+                artists = [a.get("name", "") for a in (data.get("artists") or []) if a.get("name")]
+                artist = _clean_artist(", ".join(artists))
+                dur_ms = data.get("durationMs")
+                dur = int(round(dur_ms / 1000)) if isinstance(dur_ms, (int, float)) else None
+                cover_uri = data.get("coverUri") or ((data.get("ogImage") or ""))
+                thumb = f"https://{cover_uri.replace('%%', '400x400')}" if cover_uri else None
+                if title and not _is_garbage_text(title):
+                    return _enrich_hint_from_catalogs(MetadataHint(title=title, artist=artist, duration=dur, thumbnail_url=thumb))
+            except Exception:
+                logger.debug("track.jsx не сработал для %s", url, exc_info=True)
+
+    if platform == "apple":
+        track_id = (query.get("i") or [None])[0]
+        if track_id and str(track_id).isdigit():
+            try:
+                _, text = _http_get_text(f"https://itunes.apple.com/lookup?id={track_id}&country=RU", timeout=8)
+                results = json.loads(text).get("results") or []
+                for item in results:
+                    if item.get("wrapperType") == "track" and item.get("trackName"):
+                        title = _clean_text(item["trackName"])
+                        artist = _clean_artist(item.get("artistName") or "")
+                        dur_ms = item.get("trackTimeMillis")
+                        dur = int(round(dur_ms / 1000)) if isinstance(dur_ms, (int, float)) else None
+                        thumb = item.get("artworkUrl100")
+                        if thumb:
+                            thumb = re.sub(r"\d+x\d+bb", "600x600bb", thumb)
+                        return MetadataHint(title=title, artist=artist, duration=dur, thumbnail_url=thumb)
+            except Exception:
+                pass
+
+    if platform == "deezer":
+        m = re.search(r"/track/(\d+)", path)
+        if m:
+            try:
+                _, text = _http_get_text(f"https://api.deezer.com/track/{m.group(1)}", timeout=8)
+                data = json.loads(text)
+                title = _clean_text(data.get("title") or "")
+                artist = _clean_artist((data.get("artist") or {}).get("name") or "")
+                dur = int(data["duration"]) if data.get("duration") else None
+                thumb = (data.get("album") or {}).get("cover_xl") or (data.get("album") or {}).get("cover_big")
+                if title and not _is_garbage_text(title):
+                    return MetadataHint(title=title, artist=artist, duration=dur, thumbnail_url=thumb)
+            except Exception:
+                pass
+
+    odesli_hint = _extract_odesli_metadata(url)
+    if odesli_hint:
+        return _enrich_hint_from_catalogs(odesli_hint)
+
+    try:
+        _, html_text = _http_get_text(url, timeout=10, user_agent=BOT_USER_AGENT)
+        og_title = _extract_meta_tag(html_text, "og:title") or _extract_meta_tag(html_text, "twitter:title") or ""
+        og_desc = _extract_meta_tag(html_text, "og:description") or ""
+        og_image = _extract_meta_tag(html_text, "og:image")
+        if og_title and not _is_garbage_text(og_title):
+            if platform == "apple":
+                art, tit = _clean_apple_title(og_title)
+            else:
+                art, tit = _split_artist_title(og_title)
+            if not art and og_desc and not _is_garbage_text(og_desc):
+                cand_art = _clean_artist(og_desc.split("•")[0].split("·")[0].split("—")[0])
+                if len(cand_art) <= 45:
+                    art = cand_art
+            if tit and not _is_garbage_text(tit):
+                return _enrich_hint_from_catalogs(MetadataHint(title=tit, artist=art, thumbnail_url=og_image))
+    except Exception:
+        logger.debug("HTML-парсинг метаданных не удался для %s", url, exc_info=True)
+
+    return None
+
+
+# --- ПОДГОТОВКА КВАДРАТНОЙ ОБЛОЖКИ ЧЕРЕЗ PILLOW ---
+def prepare_thumbnail(thumb_source: str | Path | None, target_path: Path, size: int = 600) -> Path | None:
+    if not thumb_source:
+        return None
+    raw_file = target_path.with_suffix(".raw_thumb")
+    try:
+        if isinstance(thumb_source, Path) or os.path.exists(str(thumb_source)):
+            shutil.copy2(str(thumb_source), raw_file)
+        elif str(thumb_source).startswith(("http://", "https://")):
+            req = urllib.request.Request(str(thumb_source), headers={"User-Agent": USER_AGENT})
+            with _build_opener().open(req, timeout=10) as resp:
+                raw_file.write_bytes(resp.read(5 * 1024 * 1024))
+        else:
+            return None
+
+        with PILImage.open(raw_file) as img:
+            img = img.convert("RGB")
+            square = ImageOps.fit(img, (size, size), method=PILImage.Resampling.LANCZOS)
+            square.save(target_path, format="JPEG", quality=90, optimize=True)
+        return target_path if target_path.exists() else None
+    except Exception:
+        logger.debug("Не удалось подготовить обложку %s", thumb_source, exc_info=True)
+        return None
+    finally:
+        if raw_file.exists():
+            try:
+                raw_file.unlink()
+            except OSError:
+                pass
+
+
+# --- СКАЧИВАНИЕ И ПОИСК ЧЕРЕЗ YT-DLP ---
+def _base_ydl_opts() -> dict:
+    opts: dict = {
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "geo_bypass": True,
+        "http_headers": {"User-Agent": USER_AGENT},
+        "socket_timeout": 20,
+        "retries": 3,
+    }
+    if YTDLP_PROXY:
+        opts["proxy"] = YTDLP_PROXY
+    if COOKIES_FILE.is_file():
+        opts["cookiefile"] = str(COOKIES_FILE)
+    return opts
+
+def ytdlp_search_tracks(query: str, limit: int = 18, target_duration: int | None = None) -> list[dict]:
+    opts = _base_ydl_opts()
+    opts["extract_flat"] = True
+    results: list[dict] = []
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
+            entries = (info or {}).get("entries") or []
+            for e in entries:
+                if not isinstance(e, dict) or not e.get("id"):
+                    continue
+                dur = e.get("duration")
+                if dur and dur > MAX_TRACK_SECONDS:
+                    continue
+                raw_t = _clean_text(e.get("title") or "")
+                raw_u = _clean_artist(e.get("uploader") or e.get("channel") or "")
+                norm_title, norm_artist = _normalize_track_and_artist(raw_t, raw_u)
+                url = e.get("url") or f"https://www.youtube.com/watch?v={e['id']}"
+                results.append({
+                    "id": e["id"],
+                    "title": norm_title or "Трек",
+                    "uploader": norm_artist,
+                    "duration": int(dur) if dur else None,
+                    "url": canonical_youtube_url(url),
+                })
+    except Exception:
+        logger.warning("Ошибка поиска yt-dlp для '%s'", query, exc_info=True)
+
+    if target_duration and results:
+        results.sort(key=lambda x: abs((x.get("duration") or target_duration) - target_duration))
+    return results
+
+def ytdlp_download_audio(
+    target_url_or_query: str,
+    out_base: Path,
+    bitrate: str,
+    hint: MetadataHint | None = None,
+) -> tuple[Path, str, str, int | None, Path | None, str | None]:
+    opts = _base_ydl_opts()
+    opts["format"] = "bestaudio/best"
+    opts["outtmpl"] = str(out_base) + ".%(ext)s"
+    opts["writethumbnail"] = True
+
+    if shutil.which("ffmpeg"):
+        opts["postprocessors"] = [{
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": "mp3",
+            "preferredquality": str(bitrate),
+        }]
+
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(target_url_or_query, download=True)
+        if "entries" in info and info["entries"]:
+            info = info["entries"][0]
+
+    dur = int(info.get("duration")) if info.get("duration") else (hint.duration if hint else None)
+    if dur and dur > MAX_TRACK_SECONDS:
+        raise ValueError("Трек превышает максимальную длительность (90 минут).")
+
+    info_track = _clean_text(info.get("track") or "")
+    info_title = _clean_text(info.get("title") or "")
+    info_artist = (
+        _clean_artist(info.get("artist") or "")
+        or _clean_artist(info.get("creator") or "")
+        or _clean_artist(info.get("uploader") or "")
+        or _clean_artist(info.get("channel") or "")
+    )
+
+    if hint and hint.title and not _is_garbage_text(hint.title):
+        raw_title = hint.title
+        raw_artist = hint.artist if (hint.artist and not _is_garbage_text(hint.artist)) else info_artist
+    else:
+        raw_title = info_track or info_title or "Track"
+        raw_artist = info_artist
+
+    clean_title, clean_artist = _normalize_track_and_artist(raw_title, raw_artist)
+
+    if not clean_artist and clean_title and clean_title != "Track":
+        enriched = _enrich_hint_from_catalogs(MetadataHint(title=clean_title, artist=""))
+        if enriched.artist:
+            clean_artist = enriched.artist
+
+    vid_id = info.get("id") if info.get("extractor_key", "").lower() in ("youtube", "soundcloud") else extract_youtube_id(target_url_or_query)
+
+    audio_path = out_base.with_suffix(".mp3")
+    if not audio_path.exists():
+        candidates = [p for p in out_base.parent.glob(f"{out_base.name}.*") if p.suffix.lower() not in (".jpg", ".jpeg", ".png", ".webp", ".part")]
+        if not candidates:
+            raise FileNotFoundError("Аудиофайл не найден после загрузки.")
+        audio_path = candidates[0]
+
+    thumb_target = out_base.with_suffix(".cover.jpg")
+    thumb_source: str | Path | None = hint.thumbnail_url if (hint and hint.thumbnail_url) else None
+    if not thumb_source:
+        for ext in (".webp", ".jpg", ".jpeg", ".png"):
+            cand_thumb = out_base.with_suffix(ext)
+            if cand_thumb.exists():
+                thumb_source = cand_thumb
+                break
+        if not thumb_source and info.get("thumbnail"):
+            thumb_source = info.get("thumbnail")
+
+    final_thumb = prepare_thumbnail(thumb_source, thumb_target, size=320)
+
+    for ext in (".webp", ".jpg", ".jpeg", ".png"):
+        p = out_base.with_suffix(ext)
+        if p.exists() and p != final_thumb:
+            try:
+                p.unlink()
+            except OSError:
+                pass
+
+    return audio_path, clean_title or "Track", clean_artist or "Неизвестен", dur, final_thumb, vid_id
+
+
+# --- ФУНКЦИИ ЧТЕНИЯ И ЗАПИСИ ТЕГОВ / ОБЛОЖКИ В АУДИОФАЙЛЫ ЧЕРЕЗ FFMPEG ---
+def probe_audio_metadata(audio_path: Path, extract_cover_to: Path | None = None) -> tuple[str, str, int | None, Path | None]:
+    """Извлекает (title, artist, duration, cover_path) из любого аудиофайла через ffprobe и ffmpeg."""
+    title, artist, dur = "", "", None
+    if shutil.which("ffprobe"):
+        try:
+            cmd = [
+                "ffprobe", "-v", "quiet",
+                "-print_format", "json",
+                "-show_format",
+                str(audio_path),
+            ]
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+            if proc.returncode == 0 and proc.stdout:
+                data = json.loads(proc.stdout)
+                fmt = data.get("format") or {}
+                if fmt.get("duration"):
+                    dur = int(round(float(fmt["duration"])))
+                tags = {k.lower(): v for k, v in (fmt.get("tags") or {}).items()}
+                title = _clean_text(tags.get("title") or "")
+                artist = _clean_artist(tags.get("artist") or tags.get("album_artist") or tags.get("performer") or "")
+        except Exception:
+            logger.debug("Ошибка чтения тегов через ffprobe", exc_info=True)
+
+    extracted_cover = None
+    if extract_cover_to and shutil.which("ffmpeg"):
+        raw_cov = extract_cover_to.with_suffix(".raw_emb.jpg")
+        try:
+            cmd_cov = [
+                "ffmpeg", "-y", "-i", str(audio_path),
+                "-an", "-vcodec", "mjpeg", "-frames:v", "1",
+                str(raw_cov),
+            ]
+            subprocess.run(cmd_cov, capture_output=True, timeout=15)
+            if raw_cov.exists() and raw_cov.stat().st_size > 200:
+                extracted_cover = prepare_thumbnail(raw_cov, extract_cover_to, size=600)
+        except Exception:
+            pass
+        finally:
+            if raw_cov.exists():
+                try:
+                    raw_cov.unlink()
+                except OSError:
+                    pass
+
+    return title, artist, dur, extracted_cover
+
+def build_tagged_mp3(
+    source_path: Path,
+    output_mp3: Path,
+    title: str,
+    artist: str,
+    cover_path: Path | None,
+    bitrate: str,
+) -> Path:
+    is_already_mp3 = source_path.suffix.lower() == ".mp3"
+    cmd = ["ffmpeg", "-y", "-i", str(source_path)]
+
+    if cover_path and cover_path.exists():
+        cmd += ["-i", str(cover_path), "-map", "0:a:0", "-map", "1:v:0"]
+    else:
+        cmd += ["-map", "0:a:0", "-vn"]
+
+    if is_already_mp3:
+        cmd += ["-c:a", "copy"]
+    else:
+        cmd += ["-acodec", "libmp3lame", "-b:a", f"{bitrate}k"]
+
+    if cover_path and cover_path.exists():
+        cmd += [
+            "-c:v", "mjpeg",
+            "-id3v2_version", "3",
+            "-metadata:s:v", "title=Album cover",
+            "-metadata:s:v", "comment=Cover (front)",
+            "-disposition:v:0", "attached_pic",
+        ]
+    else:
+        cmd += ["-id3v2_version", "3"]
+
+    cmd += [
+        "-map_metadata", "-1",
+        "-metadata", f"title={title}",
+        "-metadata", f"artist={artist}",
+        str(output_mp3),
+    ]
+
+    proc = subprocess.run(cmd, capture_output=True, timeout=180)
+    if proc.returncode != 0 or not output_mp3.exists():
+        cmd_fallback = ["ffmpeg", "-y", "-i", str(source_path)]
+        if cover_path and cover_path.exists():
+            cmd_fallback += ["-i", str(cover_path), "-map", "0:a:0", "-map", "1:v:0", "-c:v", "mjpeg", "-disposition:v:0", "attached_pic"]
+        else:
+            cmd_fallback += ["-map", "0:a:0", "-vn"]
+        cmd_fallback += [
+            "-acodec", "libmp3lame", "-b:a", f"{bitrate}k",
+            "-id3v2_version", "3",
+            "-map_metadata", "-1",
+            "-metadata", f"title={title}",
+            "-metadata", f"artist={artist}",
+            str(output_mp3),
+        ]
+        proc2 = subprocess.run(cmd_fallback, capture_output=True, timeout=180)
+        if proc2.returncode != 0 or not output_mp3.exists():
+            raise RuntimeError("Ошибка сборки MP3 через FFmpeg.")
+
+    return output_mp3
+
+
+# --- ИНТЕРФЕЙС РЕДАКТОРА АУДИО И ТЕГОВ ---
+def build_editor_text_and_kb(sess: AudioEditSession, prompt_note: str = "") -> tuple[str, types.InlineKeyboardMarkup]:
+    cov_status = "✅ Установлена" if (sess.cover_path and sess.cover_path.exists()) else "❌ Нет (без обложки)"
+    dur_str = format_duration(sess.duration) or "—"
+    fmt_label = sess.source_ext.lstrip(".").upper() or "AUDIO"
+    if fmt_label != "MP3":
+        fmt_label = f"{fmt_label} ➡️ MP3 ({get_user_bitrate(sess.user_id)} kbps)"
+
+    text = (
+        f"🎛 <b>Редактор трека и обложки</b>\n\n"
+        f"🎵 <b>Название:</b> <code>{html.escape(sess.title)}</code>\n"
+        f"👤 <b>Автор:</b> <code>{html.escape(sess.artist)}</code>\n"
+        f"🖼 <b>Обложка:</b> {cov_status}\n"
+        f"⏱ <b>Длительность:</b> {dur_str}  |  📦 <b>Формат:</b> {fmt_label}\n"
+    )
+    if prompt_note:
+        text += f"\n{prompt_note}"
+    else:
+        text += "\n<i>Выбери действие ниже (можно также распознать этот трек через Shazam!):</i>"
+
+    kb = InlineKeyboardBuilder()
+    kb.row(types.InlineKeyboardButton(text="🔍 Распознать песню (Shazam)", callback_data="ed:shazam"))
+    kb.row(
+        types.InlineKeyboardButton(text="✏️ Изменить название", callback_data="ed:title"),
+        types.InlineKeyboardButton(text="👤 Изменить автора", callback_data="ed:artist"),
+    )
+    if sess.cover_path and sess.cover_path.exists():
+        kb.row(
+            types.InlineKeyboardButton(text="🖼 Заменить обложку", callback_data="ed:cover"),
+            types.InlineKeyboardButton(text="🗑 Удалить обложку", callback_data="ed:del_cover"),
+        )
+    else:
+        kb.row(types.InlineKeyboardButton(text="🖼 Добавить обложку", callback_data="ed:cover"))
+
+    kb.row(types.InlineKeyboardButton(text="✅ Сохранить и получить MP3", callback_data="ed:save"))
+    kb.row(types.InlineKeyboardButton(text="✖️ Отмена", callback_data="ed:cancel"))
+    return text, kb.as_markup()
+
+async def render_editor_panel(sess: AudioEditSession, prompt_note: str = "", force_new: bool = False) -> None:
+    text, markup = build_editor_text_and_kb(sess, prompt_note=prompt_note)
+    has_cover = bool(sess.cover_path and sess.cover_path.exists())
+
+    if sess.panel_msg_id and not force_new and (sess.panel_has_photo == has_cover):
+        try:
+            if has_cover:
+                await bot.edit_message_media(
+                    chat_id=sess.chat_id,
+                    message_id=sess.panel_msg_id,
+                    media=types.InputMediaPhoto(
+                        media=types.FSInputFile(sess.cover_path),
+                        caption=text,
+                        parse_mode="HTML",
+                    ),
+                    reply_markup=markup,
+                )
+            else:
+                await bot.edit_message_text(
+                    chat_id=sess.chat_id,
+                    message_id=sess.panel_msg_id,
+                    text=text,
+                    parse_mode="HTML",
+                    reply_markup=markup,
+                )
+            return
+        except Exception:
+            pass
+
+    if sess.panel_msg_id:
+        try:
+            await bot.delete_message(sess.chat_id, sess.panel_msg_id)
+        except Exception:
+            pass
+
+    if has_cover:
+        sent = await bot.send_photo(
+            chat_id=sess.chat_id,
+            photo=types.FSInputFile(sess.cover_path),
+            caption=text,
+            parse_mode="HTML",
+            reply_markup=markup,
+        )
+        sess.panel_has_photo = True
+    else:
+        sent = await bot.send_message(
+            chat_id=sess.chat_id,
+            text=text,
+            parse_mode="HTML",
+            reply_markup=markup,
+        )
+        sess.panel_has_photo = False
+
+    sess.panel_msg_id = sent.message_id
+
+
+# --- ХЕНДЛЕР ГОЛОСОВЫХ СООБЩЕНИЙ (УМНЫЙ SHAZAM + РАСПОЗНАВАНИЕ НАПЕВА/РИТМА) ---
+@dp.message(F.voice)
+async def handle_voice_shazam(message: types.Message, state: FSMContext):
+    if message.chat.id == LOG_GROUP_ID:
+        return
+
+    user = message.from_user
+    register_user(user.id, username=user.username)
+    await state.clear()
+
+    voice = message.voice
+    if voice.file_size and voice.file_size > TG_VIDEO_DL_LIMIT:
+        return await message.reply("⚠️ Голосовое сообщение слишком большое (лимит до 20 МБ).")
+
+    status_msg = await message.reply(
+        "🎧 <b>Слушаю голосовое...</b>\n"
+        "<i>Анализирую мелодию, ритм, вокал и сигнатуру трека (Shazam + AI)...</i>",
+        parse_mode="HTML",
+    )
+    uid_tag = f"vshz_{user.id}_{uuid.uuid4().hex[:8]}"
+    ogg_path = DOWNLOAD_DIR / f"{uid_tag}.ogg"
+
+    try:
+        await bot.download(voice, destination=ogg_path)
+        hint, candidates, sung_text = await recognize_audio_smart(ogg_path)
+
+        if hint and hint.title:
+            method_line = f" ({hint.method})" if hint.method else ""
+            await status_msg.edit_text(
+                f"🎉 <b>Трек распознан{html.escape(method_line)}!</b>\n"
+                f"🎵 <b>{html.escape(hint.search_query)}</b>\n\n"
+                f"⏳ <i>Загружаю полную студийную версию в MP3...</i>",
+                parse_mode="HTML",
+            )
+            target_q = hint.direct_urls[0] if hint.direct_urls else f"ytsearch1:{hint.search_query}"
+            await download_and_send_single(message, user, target_q, status_msg=status_msg, hint=hint)
+
+            # Если дополнительно нашлись похожие варианты по напетым словам — даём кнопки на выбор
+            if candidates and len(candidates) > 1:
+                session_id = uuid.uuid4().hex[:10]
+                search_sessions[session_id] = {
+                    "user_id": user.id,
+                    "query": sung_text or hint.search_query,
+                    "items": candidates,
+                    "created_at": time.time(),
+                }
+                await message.answer(
+                    f"🎶 Другие похожие версии по твоему напеву <b>«{html.escape(sung_text or hint.search_query)}»</b>:",
+                    parse_mode="HTML",
+                    reply_markup=build_search_keyboard(session_id, page=0),
+                )
+            await send_log(
+                f"🎤 <b>Распознано ГС ({html.escape(hint.method or 'Shazam')}):</b> {html.escape(hint.search_query)}\n"
+                f"• Юзер: @{user.username or 'нет'} (<code>{user.id}</code>)"
+            )
+            return
+
+        # Если песня не угадана — предлагаем открыть само голосовое в редакторе MP3/обложек
+        cleanup_audio_edit_session(user.id)
+        edit_src = DOWNLOAD_DIR / f"edit_{user.id}_{uuid.uuid4().hex[:6]}.ogg"
+        shutil.copy2(ogg_path, edit_src)
+        sess = AudioEditSession(
+            user_id=user.id,
+            chat_id=message.chat.id,
+            source_path=edit_src,
+            source_ext=".ogg",
+            title="Голосовое сообщение",
+            artist=user.first_name or "Автор",
+            duration=voice.duration,
+        )
+        audio_edit_sessions[user.id] = sess
+        await state.set_state(AudioEditStates.editing)
+
+        kb = InlineKeyboardBuilder()
+        kb.row(types.InlineKeyboardButton(text="🎛 Сделать MP3 из этого ГС (Редактор)", callback_data="ed:open_from_voice"))
+        await status_msg.edit_text(
+            "😔 <b>Не удалось точно угадать песню по этому голосовому.</b>\n\n"
+            "💡 <b>Как повысить точность до 100%:</b>\n"
+            "• Напой мелодию чуть громче и длиннее (7–12 секунд) или проговори пару строчек из припева;\n"
+            "• Либо просто напиши мне любые слова из песни текстом!\n\n"
+            "👇 <i>А если ты хотел сконвертировать само это голосовое в MP3 и поставить обложку — нажми кнопку ниже:</i>",
+            parse_mode="HTML",
+            reply_markup=kb.as_markup(),
+        )
+    except Exception as exc:
+        logger.warning("Ошибка распознавания голосового: %s", exc, exc_info=True)
+        await status_msg.edit_text("❌ Произошла ошибка при анализе голосового сообщения.")
+    finally:
+        if ogg_path.exists():
+            try:
+                ogg_path.unlink()
+            except OSError:
+                pass
+
+
+# --- ХЕНДЛЕР ЗАГРУЗКИ СВОЕГО АУДИО (MP3 / WAV / FLAC) В РЕДАКТОР + SHAZAM ---
+def _is_audio_document(doc: types.Document | None) -> bool:
+    if not doc:
+        return False
+    mime = (doc.mime_type or "").lower()
+    if mime.startswith("audio/"):
+        return True
+    ext = Path(doc.file_name or "").suffix.lower()
+    return ext in SUPPORTED_AUDIO_EXTS
+
+@dp.message(F.audio | F.document.func(_is_audio_document))
+async def handle_user_audio_for_editor(message: types.Message, state: FSMContext):
+    if message.chat.id == LOG_GROUP_ID:
+        return
+
+    user = message.from_user
+    register_user(user.id, username=user.username)
+    await state.clear()
+    cleanup_audio_edit_session(user.id)
+
+    media = message.audio or message.document
+    if media.file_size and media.file_size > TG_VIDEO_DL_LIMIT:
+        return await message.reply(
+            "⚠️ <b>Файл слишком большой!</b>\n"
+            "Telegram разрешает ботам принимать файлы размером до <b>20 МБ</b>.\n"
+            "Если это тяжелый WAV-файл, попробуй сжать его или отправь файл до 20 МБ.",
+            parse_mode="HTML",
+        )
+
+    wait_msg = await message.reply("⏳ Загружаю аудио в редактор тегов и обложки...")
+    uid_tag = f"edit_{user.id}_{uuid.uuid4().hex[:8]}"
+
+    orig_filename = getattr(media, "file_name", "") or ""
+    ext = Path(orig_filename).suffix.lower()
+    if not ext:
+        ext = ".mp3" if message.audio else ".wav"
+
+    src_path = DOWNLOAD_DIR / f"{uid_tag}{ext}"
+    cov_path = DOWNLOAD_DIR / f"{uid_tag}_cover.jpg"
+
+    try:
+        await bot.download(media, destination=src_path)
+
+        tg_thumb = getattr(media, "thumbnail", None)
+        extracted_cov: Path | None = None
+        if tg_thumb:
+            raw_tg_thumb = DOWNLOAD_DIR / f"{uid_tag}_tgthumb.jpg"
+            try:
+                await bot.download(tg_thumb, destination=raw_tg_thumb)
+                extracted_cov = await asyncio.to_thread(prepare_thumbnail, raw_tg_thumb, cov_path, 600)
+            except Exception:
+                pass
+            finally:
+                if raw_tg_thumb.exists():
+                    try:
+                        raw_tg_thumb.unlink()
+                    except OSError:
+                        pass
+
+        pr_title, pr_artist, pr_dur, ff_cov = await asyncio.to_thread(
+            probe_audio_metadata,
+            src_path,
+            None if extracted_cov else cov_path,
+        )
+        final_cov = extracted_cov or ff_cov
+
+        tg_title = _clean_text(getattr(media, "title", "") or "")
+        tg_artist = _clean_artist(getattr(media, "performer", "") or "")
+        stem_clean = _clean_text(Path(orig_filename).stem) if orig_filename else ""
+
+        raw_title = tg_title or pr_title or stem_clean or "Без названия"
+        raw_artist = tg_artist or pr_artist or ""
+
+        if not raw_artist and stem_clean:
+            s_art, s_tit = _split_artist_title(stem_clean)
+            if s_art and s_tit:
+                raw_artist = s_art
+                if raw_title == stem_clean:
+                    raw_title = s_tit
+
+        if not raw_artist:
+            raw_artist = user.first_name or "Неизвестен"
+
+        dur = getattr(media, "duration", None) or pr_dur
+
+        sess = AudioEditSession(
+            user_id=user.id,
+            chat_id=message.chat.id,
+            source_path=src_path,
+            source_ext=ext,
+            title=raw_title[:64],
+            artist=raw_artist[:64],
+            duration=dur,
+            cover_path=final_cov,
+        )
+        audio_edit_sessions[user.id] = sess
+        await state.set_state(AudioEditStates.editing)
+
+        try:
+            await wait_msg.delete()
+        except Exception:
+            pass
+
+        await render_editor_panel(sess)
+    except Exception as exc:
+        logger.warning("Ошибка открытия редактора аудио: %s", exc, exc_info=True)
+        cleanup_audio_edit_session(user.id)
+        await wait_msg.edit_text("❌ Не удалось прочитать этот аудиофайл. Убедись, что файл не повреждён.")
+
+
+# --- КОЛБЭКИ И ВВОД ДАННЫХ В РЕДАКТОРЕ АУДИО ---
+@dp.callback_query(F.data.startswith("ed:"))
+async def cb_audio_editor_actions(call: types.CallbackQuery, state: FSMContext):
+    user = call.from_user
+    sess = audio_edit_sessions.get(user.id)
+    action = call.data.split(":", 1)[1]
+
+    if action == "cancel":
+        await state.clear()
+        cleanup_audio_edit_session(user.id)
+        await call.answer("Редактирование отменено")
+        try:
+            await call.message.delete()
+        except Exception:
+            pass
+        return
+
+    if not sess or not sess.source_path.exists():
+        await state.clear()
+        await call.answer("⚠️ Сессия редактора устарела. Отправь аудиофайл заново!", show_alert=True)
+        return
+
+    if action == "open_from_voice":
+        await state.set_state(AudioEditStates.editing)
+        await call.answer()
+        try:
+            await call.message.delete()
+        except Exception:
+            pass
+        await render_editor_panel(sess)
+        return
+
+    if action == "shazam":
+        await call.answer("🔍 Распознаю песню через Shazam...")
+        await render_editor_panel(sess, prompt_note="⏳ <i>Анализирую аудио через Shazam...</i>")
+        hint, _, _ = await recognize_audio_smart(sess.source_path)
+        if hint and hint.title:
+            sess.title = hint.title[:64]
+            if hint.artist:
+                sess.artist = hint.artist[:64]
+            if hint.thumbnail_url:
+                new_cov = DOWNLOAD_DIR / f"shzcov_{user.id}_{uuid.uuid4().hex[:6]}.jpg"
+                prep = await asyncio.to_thread(prepare_thumbnail, hint.thumbnail_url, new_cov, 600)
+                if prep and prep.exists():
+                    if sess.cover_path and sess.cover_path.exists():
+                        try:
+                            sess.cover_path.unlink()
+                        except OSError:
+                            pass
+                    sess.cover_path = prep
+            await render_editor_panel(
+                sess,
+                prompt_note=(
+                    f"🎉 <b>Распознано: {html.escape(sess.artist)} — {html.escape(sess.title)}!</b>\n"
+                    f"<i>Теги и обложка автоматически подставлены. Нажми «Сохранить и получить MP3»!</i>"
+                ),
+            )
+        else:
+            await render_editor_panel(sess, prompt_note="😔 <i>Shazam не нашёл точного совпадения для этого файла.</i>")
+        return
+
+    if action == "title":
+        await state.set_state(AudioEditStates.waiting_title)
+        await call.answer()
+        await render_editor_panel(
+            sess,
+            prompt_note="✏️ <b>Введи новое название трека</b> и отправь его в чат:",
+        )
+    elif action == "artist":
+        await state.set_state(AudioEditStates.waiting_artist)
+        await call.answer()
+        await render_editor_panel(
+            sess,
+            prompt_note="👤 <b>Введи нового автора (исполнителя)</b> и отправь его в чат:",
+        )
+    elif action == "cover":
+        await state.set_state(AudioEditStates.waiting_cover)
+        await call.answer()
+        await render_editor_panel(
+            sess,
+            prompt_note="🖼 <b>Отправь картинку или фото</b> в чат, чтобы установить обложку:",
+        )
+    elif action == "del_cover":
+        if sess.cover_path and sess.cover_path.exists():
+            try:
+                sess.cover_path.unlink()
+            except OSError:
+                pass
+        sess.cover_path = None
+        await state.set_state(AudioEditStates.editing)
+        await call.answer("🗑 Обложка удалена!")
+        await render_editor_panel(sess, prompt_note="✅ <i>Обложка удалена!</i>")
+    elif action == "save":
+        await state.clear()
+        await call.answer("⏳ Собираю MP3 с новыми тегами...")
+        try:
+            await call.message.delete()
+        except Exception:
+            pass
+
+        wait_msg = await call.message.answer("⏳ <b>Сохраняю теги, вшиваю обложку и готовлю MP3...</b>", parse_mode="HTML")
+        out_mp3 = DOWNLOAD_DIR / f"final_{user.id}_{uuid.uuid4().hex[:6]}.mp3"
+        tg_thumb = DOWNLOAD_DIR / f"tgthumb_{user.id}_{uuid.uuid4().hex[:6]}.jpg"
+        bitrate = get_user_bitrate(user.id)
+
+        try:
+            async with download_semaphore:
+                await asyncio.to_thread(
+                    build_tagged_mp3,
+                    sess.source_path,
+                    out_mp3,
+                    sess.title,
+                    sess.artist,
+                    sess.cover_path,
+                    bitrate,
+                )
+                thumb_for_tg = None
+                if sess.cover_path and sess.cover_path.exists():
+                    thumb_for_tg = await asyncio.to_thread(prepare_thumbnail, sess.cover_path, tg_thumb, 320)
+
+            safe_filename = re.sub(r'[\\/*?:"<>|]', "", f"{sess.artist} - {sess.title}")[:80].strip() or "track"
+            await call.message.answer_audio(
+                audio=types.FSInputFile(out_mp3, filename=f"{safe_filename}.mp3"),
+                title=sess.title[:64],
+                performer=sess.artist[:64],
+                duration=sess.duration,
+                thumbnail=types.FSInputFile(thumb_for_tg) if thumb_for_tg else None,
+                caption=get_mp3_caption(user.id),
+                parse_mode="HTML",
+            )
+            try:
+                await wait_msg.delete()
+            except Exception:
+                pass
+
+            await send_log(
+                f"🎛 <b>Отредактирован трек ({sess.source_ext.lstrip('.').upper()} ➡️ MP3):</b> "
+                f"{html.escape(sess.artist)} — {html.escape(sess.title)}\n"
+                f"• Обложка: {'Да' if sess.cover_path else 'Нет'}\n"
+                f"• Юзер: @{user.username or 'нет'} (<code>{user.id}</code>)"
+            )
+        except Exception as exc:
+            logger.warning("Ошибка сохранения трека в редакторе: %s", exc, exc_info=True)
+            await wait_msg.edit_text("❌ Произошла ошибка при сборке MP3.")
+        finally:
+            cleanup_audio_edit_session(user.id)
+            for p in (out_mp3, tg_thumb):
+                if p.exists():
+                    try:
+                        p.unlink()
+                    except OSError:
+                        pass
+
+@dp.message(AudioEditStates.waiting_title, F.text)
+async def handle_editor_new_title(message: types.Message, state: FSMContext):
+    user = message.from_user
+    sess = audio_edit_sessions.get(user.id)
+    if not sess:
+        await state.clear()
+        return
+
+    new_title = _clean_text(message.text or "")[:64]
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    if new_title:
+        sess.title = new_title
+    await state.set_state(AudioEditStates.editing)
+    await render_editor_panel(sess, prompt_note=f"✅ <i>Название изменено на «{html.escape(sess.title)}»!</i>")
+
+@dp.message(AudioEditStates.waiting_artist, F.text)
+async def handle_editor_new_artist(message: types.Message, state: FSMContext):
+    user = message.from_user
+    sess = audio_edit_sessions.get(user.id)
+    if not sess:
+        await state.clear()
+        return
+
+    new_artist = _clean_text(message.text or "")[:64]
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    if new_artist:
+        sess.artist = new_artist
+    await state.set_state(AudioEditStates.editing)
+    await render_editor_panel(sess, prompt_note=f"✅ <i>Автор изменён на «{html.escape(sess.artist)}»!</i>")
+
+def _is_image_document(doc: types.Document | None) -> bool:
+    if not doc:
+        return False
+    mime = (doc.mime_type or "").lower()
+    ext = Path(doc.file_name or "").suffix.lower()
+    return mime.startswith("image/") or ext in (".jpg", ".jpeg", ".png", ".webp")
+
+@dp.message(
+    AudioEditStates.waiting_cover,
+    F.photo | F.document.func(_is_image_document),
+)
+@dp.message(
+    AudioEditStates.editing,
+    F.photo | F.document.func(_is_image_document),
+)
+async def handle_editor_new_cover(message: types.Message, state: FSMContext):
+    user = message.from_user
+    sess = audio_edit_sessions.get(user.id)
+    if not sess:
+        await state.clear()
+        return
+
+    media = message.photo[-1] if message.photo else message.document
+    raw_img = DOWNLOAD_DIR / f"rawcov_{user.id}_{uuid.uuid4().hex[:6]}.img"
+    target_cov = DOWNLOAD_DIR / f"edit_{user.id}_{uuid.uuid4().hex[:6]}_cover.jpg"
+
+    try:
+        await bot.download(media, destination=raw_img)
+        prepared = await asyncio.to_thread(prepare_thumbnail, raw_img, target_cov, 600)
+        try:
+            await message.delete()
+        except Exception:
+            pass
+
+        if prepared and prepared.exists():
+            if sess.cover_path and sess.cover_path.exists() and sess.cover_path != prepared:
+                try:
+                    sess.cover_path.unlink()
+                except OSError:
+                    pass
+            sess.cover_path = prepared
+            await state.set_state(AudioEditStates.editing)
+            await render_editor_panel(sess, prompt_note="✅ <i>Новая обложка успешно установлена!</i>")
+        else:
+            await render_editor_panel(sess, prompt_note="⚠️ <i>Не удалось обработать эту картинку. Пришли другое фото (JPG/PNG).</i>")
+    finally:
+        if raw_img.exists():
+            try:
+                raw_img.unlink()
+            except OSError:
+                pass
+
+
+# --- КЭШ ПОИСКА И ПАГИНАЦИЯ ---
+search_sessions: dict[str, dict] = {}
+shazam_quick_cache: dict[str, MetadataHint] = {}
+
+def build_search_keyboard(session_id: str, page: int = 0) -> types.InlineKeyboardMarkup:
+    sess = search_sessions.get(session_id) or {}
+    items: list[dict] = sess.get("items") or []
+    total = len(items)
+    start = page * RESULTS_PER_PAGE
+    end = min(start + RESULTS_PER_PAGE, total)
+
+    kb = InlineKeyboardBuilder()
+    for idx in range(start, end):
+        item = items[idx]
+        dur_str = format_duration(item.get("duration"))
+        prefix = f"[{dur_str}] " if dur_str else "🎵 "
+        label = f"{prefix}{item.get('title', 'Трек')}"
+        if item.get("uploader") and item["uploader"].lower() not in label.lower():
+            label = f"{prefix}{item['uploader']} — {item.get('title', 'Трек')}"
+        kb.row(types.InlineKeyboardButton(text=label[:60], callback_data=f"dl:{session_id}:{idx}"))
+
+    nav_buttons = []
+    if page > 0:
+        nav_buttons.append(types.InlineKeyboardButton(text="⬅️ Назад", callback_data=f"page:{session_id}:{page - 1}"))
+    if end < total:
+        nav_buttons.append(types.InlineKeyboardButton(text="Вперёд ➡️", callback_data=f"page:{session_id}:{page + 1}"))
+    if nav_buttons:
+        kb.row(*nav_buttons)
+
+    return kb.as_markup()
+
+
+# --- ЛОГИРОВАНИЕ В ГРУППУ ЛОГОВ ---
+async def send_log(text: str, reply_markup: types.InlineKeyboardMarkup | None = None) -> None:
+    try:
+        await bot.send_message(
+            LOG_GROUP_ID,
+            text,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            reply_markup=reply_markup,
+        )
+    except Exception:
+        logger.warning("Не удалось отправить лог в группу %s", LOG_GROUP_ID)
+
+
+# --- АДМИН-ПАНЕЛЬ (/panel) И УПРАВЛЕНИЕ ПОДПИСКОЙ В ГРУППЕ ЛОГОВ ---
+def build_admin_panel_text_and_kb() -> tuple[str, types.InlineKeyboardMarkup]:
+    total_users = len(users_db)
+    pro_users = sum(1 for u in users_db if is_pro_user(u))
+    cached_tracks = len(inline_audio_cache)
+
+    text = (
+        f"🎛 <b>Панель управления ботом (@{BOT_USERNAME})</b>\n\n"
+        f"👥 Всего пользователей: <b>{total_users}</b>\n"
+        f"💎 С подпиской PRO (320 kbps): <b>{pro_users}</b>\n"
+        f"⚡ Треков в быстром инлайн-кэше: <b>{cached_tracks}</b>\n\n"
+        f"Выбери нужное действие на кнопках ниже:"
+    )
+
+    kb = InlineKeyboardBuilder()
+    kb.row(
+        types.InlineKeyboardButton(text="💎 Выдать подписку (PRO)", callback_data="panel:give_pro"),
+        types.InlineKeyboardButton(text="🚫 Забрать подписку", callback_data="panel:take_pro"),
+    )
+    kb.row(
+        types.InlineKeyboardButton(text="✉️ Сделать рассылку", callback_data="panel:mail"),
+        types.InlineKeyboardButton(text="🔄 Обновить статистику", callback_data="panel:refresh"),
+    )
+    return text, kb.as_markup()
+
+@dp.message(Command("panel", "admin", "stats"), F.chat.id == LOG_GROUP_ID)
+async def cmd_admin_panel(message: types.Message, state: FSMContext):
+    await state.clear()
+    text, markup = build_admin_panel_text_and_kb()
+    await message.reply(text, parse_mode="HTML", reply_markup=markup)
+
+@dp.callback_query(F.data == "panel:refresh", F.message.chat.id == LOG_GROUP_ID)
+async def cb_panel_refresh(call: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    text, markup = build_admin_panel_text_and_kb()
+    await call.answer("Обновлено!")
+    try:
+        await call.message.edit_text(text, parse_mode="HTML", reply_markup=markup)
+    except Exception:
+        pass
+
+@dp.callback_query(F.data == "panel:give_pro", F.message.chat.id == LOG_GROUP_ID)
+async def cb_panel_give_pro(call: types.CallbackQuery, state: FSMContext):
+    await state.set_state(AdminStates.give_pro_target)
+    await call.answer()
+    kb = InlineKeyboardBuilder()
+    kb.add(types.InlineKeyboardButton(text="✖️ Отмена", callback_data="panel:refresh"))
+    await call.message.edit_text(
+        "💎 <b>Выдача PRO-подписки (320 kbps + альбомы)</b>\n\n"
+        "Отправь в чат <code>@username</code> или цифровой <code>ID</code> пользователя:",
+        parse_mode="HTML",
+        reply_markup=kb.as_markup(),
+    )
+
+@dp.callback_query(F.data == "panel:take_pro", F.message.chat.id == LOG_GROUP_ID)
+async def cb_panel_take_pro(call: types.CallbackQuery, state: FSMContext):
+    await state.set_state(AdminStates.take_pro_target)
+    await call.answer()
+    kb = InlineKeyboardBuilder()
+    kb.add(types.InlineKeyboardButton(text="✖️ Отмена", callback_data="panel:refresh"))
+    await call.message.edit_text(
+        "🚫 <b>Снятие PRO-подписки</b>\n\n"
+        "Отправь в чат <code>@username</code> или цифровой <code>ID</code> пользователя, у которого нужно забрать подписку:",
+        parse_mode="HTML",
+        reply_markup=kb.as_markup(),
+    )
+
+@dp.callback_query(F.data == "panel:mail", F.message.chat.id == LOG_GROUP_ID)
+async def cb_panel_mail(call: types.CallbackQuery, state: FSMContext):
+    await state.set_state(AdminStates.mailing_text)
+    await call.answer()
+    kb = InlineKeyboardBuilder()
+    kb.add(types.InlineKeyboardButton(text="✖️ Отмена", callback_data="panel:refresh"))
+    await call.message.edit_text(
+        "✉️ <b>Рассылка всем пользователям</b>\n\n"
+        "Отправь сообщение (текст, фото, видео или кружочек), которое нужно разослать по базе:",
+        parse_mode="HTML",
+        reply_markup=kb.as_markup(),
+    )
+
+@dp.message(AdminStates.give_pro_target, F.chat.id == LOG_GROUP_ID)
+async def process_give_pro_state(message: types.Message, state: FSMContext):
+    await state.clear()
+    target = (message.text or "").strip().split()[0]
+    ok, uid = await set_manual_pro_async(target, True)
+    text, markup = build_admin_panel_text_and_kb()
+    if ok and uid:
+        await message.reply(
+            f"✅ <b>PRO-подписка успешно выдана</b> пользователю <b>{html.escape(target)}</b> (ID: <code>{uid}</code>)!",
+            parse_mode="HTML",
+        )
+        try:
+            await bot.send_message(
+                uid,
+                "💎 <b>Тебе открыт полный PRO-доступ!</b>\n\n"
+                "• Качество всех треков и видео в MP3: <b>320 kbps</b>\n"
+                "• Скачивание альбомов и плейлистов целиком без ограничений!",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+    else:
+        await message.reply(
+            f"❌ Не удалось найти пользователя <b>{html.escape(target)}</b>.\n"
+            f"Попроси его нажать /start в боте или введи его цифровой ID.",
+            parse_mode="HTML",
+        )
+    await message.answer(text, parse_mode="HTML", reply_markup=markup)
+
+@dp.message(AdminStates.take_pro_target, F.chat.id == LOG_GROUP_ID)
+async def process_take_pro_state(message: types.Message, state: FSMContext):
+    await state.clear()
+    target = (message.text or "").strip().split()[0]
+    ok, uid = await set_manual_pro_async(target, False)
+    text, markup = build_admin_panel_text_and_kb()
+    if ok and uid:
+        await message.reply(
+            f"🚫 <b>PRO-подписка снята</b> у пользователя <b>{html.escape(target)}</b> (ID: <code>{uid}</code>).",
+            parse_mode="HTML",
+        )
+    else:
+        await message.reply(f"❌ Пользователь <b>{html.escape(target)}</b> не найден в базе.", parse_mode="HTML")
+    await message.answer(text, parse_mode="HTML", reply_markup=markup)
+
+@dp.message(Command("pro", "vip", "full", "unpro", "unvip"), F.chat.id == LOG_GROUP_ID)
+async def cmd_log_group_pro(message: types.Message, command: CommandObject):
+    if not command.args:
+        return await message.reply("Используй <code>/panel</code> для управления через кнопки или пиши <code>/pro @username</code>", parse_mode="HTML")
+
+    target = command.args.split()[0]
+    give_pro = not command.command.startswith("un")
+    ok, uid = await set_manual_pro_async(target, give_pro)
+
+    if not ok or not uid:
+        return await message.reply(
+            f"❌ Пользователь <b>{html.escape(target)}</b> еще не найден в базе.\n"
+            f"Попроси его нажать /start в боте, либо выдай права по цифровому ID.",
+            parse_mode="HTML",
+        )
+
+    if give_pro:
+        await message.reply(f"✅ Фулл-права (PRO) выданы для <b>{html.escape(target)}</b> (ID: <code>{uid}</code>)!", parse_mode="HTML")
+        try:
+            await bot.send_message(
+                uid,
+                "💎 <b>Тебе открыт полный PRO-доступ!</b>\n\n"
+                "• Качество всех треков и видео в MP3: <b>320 kbps</b>\n"
+                "• Скачивание альбомов и плейлистов целиком без ограничений!",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+    else:
+        await message.reply(f"🚫 PRO-статус снят у пользователя <b>{html.escape(target)}</b> (ID: <code>{uid}</code>).", parse_mode="HTML")
+
+@dp.callback_query(F.data.startswith("givepro:"), F.message.chat.id == LOG_GROUP_ID)
+async def cb_quick_give_pro(call: types.CallbackQuery):
+    uid_str = call.data.split(":", 1)[1]
+    ok, uid = await set_manual_pro_async(uid_str, True)
+    if ok and uid:
+        await call.answer("✅ Фулл-права (PRO) выданы!", show_alert=True)
+        await call.message.edit_reply_markup(reply_markup=None)
+        await call.message.reply(f"💎 Выдан полный PRO-доступ пользователю <code>{uid}</code>", parse_mode="HTML")
+        try:
+            await bot.send_message(
+                uid,
+                "💎 <b>Тебе открыт полный PRO-доступ!</b>\n\n"
+                "• Качество всех треков и видео в MP3: <b>320 kbps</b>\n"
+                "• Скачивание альбомов и плейлистов целиком без ограничений!",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+    else:
+        await call.answer("Ошибка выдачи прав", show_alert=True)
+
+@dp.message(Command("mail"), F.chat.id == LOG_GROUP_ID)
+async def cmd_mail_start(message: types.Message, state: FSMContext):
+    await state.set_state(AdminStates.mailing_text)
+    await message.reply("✉️ Отправь сообщение (текст, фото или видео), которое нужно разослать всем пользователям бота. Для отмены напиши /cancel.")
+
+@dp.message(Command("cancel"), F.chat.id == LOG_GROUP_ID)
+async def cmd_cancel_state(message: types.Message, state: FSMContext):
+    await state.clear()
+    await message.reply("❎ Действие отменено.")
+
+@dp.message(AdminStates.mailing_text, F.chat.id == LOG_GROUP_ID)
+async def process_mailing(message: types.Message, state: FSMContext):
+    await state.clear()
+    status = await message.reply(f"⏳ Начинаю рассылку на {len(users_db)} пользователей...")
+    sent, blocked = 0, 0
+    for uid in list(users_db):
+        try:
+            await message.copy_to(uid)
+            sent += 1
+            await asyncio.sleep(0.05)
+        except TelegramForbiddenError:
+            blocked += 1
+        except Exception:
+            pass
+    await status.edit_text(f"✅ Рассылка завершена!\nДоставлено: <b>{sent}</b>\nЗаблокировали бота: <b>{blocked}</b>", parse_mode="HTML")
+
+
+# --- ИНЛАЙН-РЕЖИМ (@savetrackbyf_bot название песни в любом чате) ---
+@dp.inline_query()
+async def handle_inline_query(inline_query: types.InlineQuery):
+    user = inline_query.from_user
+    register_user(user.id, username=user.username)
+    query = _clean_text(inline_query.query or "")
+
+    if len(query) < 2:
+        results = []
+        cached_items = sorted(inline_audio_cache.items(), key=lambda x: x[1].get("ts", 0), reverse=True)[:15]
+        for vid_id, data in cached_items:
+            results.append(
+                types.InlineQueryResultCachedAudio(
+                    id=f"cached_{vid_id}",
+                    audio_file_id=data["file_id"],
+                    caption=get_mp3_caption(user.id),
+                    parse_mode="HTML",
+                )
+            )
+        return await inline_query.answer(
+            results=results,
+            cache_time=5,
+            is_personal=True,
+            button=types.InlineQueryResultsButton(
+                text="🔎 Введи название песни после @юза...",
+                start_parameter="inline_help",
+            ),
+        )
+
+    found = await asyncio.to_thread(ytdlp_search_tracks, query, 10)
+    results = []
+
+    for item in found:
+        vid_id = item.get("id")
+        if not vid_id:
+            continue
+        title = item.get("title") or "Трек"
+        artist = item.get("uploader") or "Музыка"
+        dur = item.get("duration")
+        dur_str = format_duration(dur)
+
+        if vid_id in inline_audio_cache and inline_audio_cache[vid_id].get("file_id"):
+            results.append(
+                types.InlineQueryResultCachedAudio(
+                    id=f"cached_{vid_id}",
+                    audio_file_id=inline_audio_cache[vid_id]["file_id"],
+                    caption=get_mp3_caption(user.id),
+                    parse_mode="HTML",
+                )
+            )
+        else:
+            kb = InlineKeyboardBuilder()
+            kb.add(types.InlineKeyboardButton(text="⏳ Загружаю MP3...", callback_data="inline_loading"))
+            desc = f"{artist} • {dur_str}" if dur_str else artist
+            results.append(
+                types.InlineQueryResultArticle(
+                    id=f"yt_{vid_id}",
+                    title=f"🎵 {title}",
+                    description=desc,
+                    thumbnail_url=f"https://i.ytimg.com/vi/{vid_id}/hqdefault.jpg",
+                    input_message_content=types.InputTextMessageContent(
+                        message_text=f"⏳ <b>Загружаю трек:</b> {html.escape(artist)} — {html.escape(title)}...",
+                        parse_mode="HTML",
+                    ),
+                    reply_markup=kb.as_markup(),
+                )
+            )
+
+    await inline_query.answer(results=results, cache_time=15, is_personal=True)
+
+@dp.chosen_inline_result()
+async def handle_chosen_inline_result(chosen: types.ChosenInlineResult):
+    if not chosen.result_id.startswith("yt_") or not chosen.inline_message_id:
+        return
+
+    vid_id = chosen.result_id[3:]
+    user = chosen.from_user
+    url = f"https://www.youtube.com/watch?v={vid_id}"
+    uid_tag = f"inl_{user.id}_{uuid.uuid4().hex[:6]}"
+    out_base = DOWNLOAD_DIR / f"track_{uid_tag}"
+    audio_path: Path | None = None
+    thumb_path: Path | None = None
+    bitrate = get_user_bitrate(user.id)
+
+    try:
+        async with download_semaphore:
+            audio_path, title, artist, dur, thumb_path, _ = await asyncio.to_thread(
+                ytdlp_download_audio,
+                url,
+                out_base,
+                bitrate,
+                None,
+            )
+
+        safe_filename = re.sub(r'[\\/*?:"<>|]', "", f"{artist} - {title}")[:80].strip() or "track"
+        storage_msg = await bot.send_audio(
+            chat_id=LOG_GROUP_ID,
+            audio=types.FSInputFile(audio_path, filename=f"{safe_filename}.mp3"),
+            title=title[:64],
+            performer=artist[:64],
+            duration=dur,
+            thumbnail=types.FSInputFile(thumb_path) if thumb_path else None,
+            caption=(
+                f"⚡ <b>Инлайн-отправка ({bitrate} kbps):</b> {html.escape(artist)} — {html.escape(title)}\n"
+                f"• Юзер: @{user.username or 'нет'} (<code>{user.id}</code>)"
+            ),
+            parse_mode="HTML",
+        )
+
+        if storage_msg.audio and storage_msg.audio.file_id:
+            file_id = storage_msg.audio.file_id
+            cache_track_file_id(vid_id, file_id, title, artist, dur)
+
+            await bot.edit_message_media(
+                inline_message_id=chosen.inline_message_id,
+                media=types.InputMediaAudio(
+                    media=file_id,
+                    title=title[:64],
+                    performer=artist[:64],
+                    duration=dur,
+                    caption=get_mp3_caption(user.id),
+                    parse_mode="HTML",
+                ),
+                reply_markup=None,
+            )
+    except Exception as exc:
+        logger.warning("Ошибка инлайн-скачивания %s: %s", vid_id, exc, exc_info=True)
+        try:
+            await bot.edit_message_text(
+                inline_message_id=chosen.inline_message_id,
+                text=f"❌ Не удалось загрузить этот трек. Попробуй найти другую версию через @{BOT_USERNAME}",
+                reply_markup=None,
+            )
+        except Exception:
+            pass
+    finally:
+        for p in (audio_path, thumb_path):
+            if p and p.exists():
+                try:
+                    p.unlink()
+                except OSError:
+                    pass
+
+@dp.callback_query(F.data == "inline_loading")
+async def cb_inline_loading(call: types.CallbackQuery):
+    await call.answer("⏳ Трек уже скачивается и сейчас появится в этом сообщении!", show_alert=False)
+
+
+# --- СТАРТ, ПРОФИЛЬ И ПОДДЕРЖКА ---
+def get_main_inline_kb(user_id: int) -> types.InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.row(
+        types.InlineKeyboardButton(
+            text="🔎 Искать музыку в любом чате",
+            switch_inline_query_current_chat="",
+        )
+    )
+    kb.row(
+        types.InlineKeyboardButton(text="🎤 Shazam / Напеть", callback_data="shazam_info"),
+        types.InlineKeyboardButton(text="🎛 Редактор MP3 / WAV", callback_data="editor_info"),
+    )
+    kb.row(
+        types.InlineKeyboardButton(text="💎 Мой статус / PRO", callback_data="my_pro"),
+        types.InlineKeyboardButton(text="🆘 Поддержка", callback_data="support"),
+    )
+    return kb.as_markup()
+
+@dp.message(CommandStart())
+async def cmd_start(message: types.Message, command: CommandObject, state: FSMContext):
+    await state.clear()
+    user = message.from_user
+    cleanup_audio_edit_session(user.id)
+
+    ref_id = None
+    if command.args:
+        arg = command.args.strip()
+        if arg.startswith("ref_") and arg[4:].isdigit():
+            ref_id = int(arg[4:])
+        elif arg.isdigit():
+            ref_id = int(arg)
+
+    is_new, credited_ref = register_user(user.id, referrer_id=ref_id, username=user.username)
+
+    if credited_ref:
+        inv_count = get_invited_count(credited_ref)
+        try:
+            await bot.send_message(
+                credited_ref,
+                f"🎉 <b>Друг ({html.escape(user.first_name)}) перешел по твоей ссылке!</b>\n"
+                f"Приглашено друзей: <b>{inv_count}</b>.\n"
+                f"💎 Тебе открыт <b>PRO-доступ</b>: максимальное качество <b>320 kbps</b> и скачивание альбомов целиком!",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+
+    pro_active = is_pro_user(user.id)
+    bitrate_str = "320 kbps (PRO 💎)" if pro_active else "192 kbps (Базовый)"
+
+    welcome_text = (
+        f"👋 <b>Привет, {html.escape(user.first_name)}!</b>\n\n"
+        f"Не знаешь, что за песня играет, или хочешь скачать трек в <b>MP3</b>?\n\n"
+        f"🎧 <b>Что умеет этот бот:</b>\n"
+        f"• <b>Умный Shazam (даже по напеву!):</b> отправь <b>голосовое, видео или кружочек</b> — я распознаю трек (даже если он ускорен, замедлен или ты просто напел мелодию/слова) и пришлю оригинал в MP3!\n"
+        f"• <b>Поиск по названию:</b> напиши название трека, артиста или строчку из песни.\n"
+        f"• <b>Музыка прямо в чатах:</b> пиши <code>@{BOT_USERNAME} название</code> в любом чате, чтобы сразу отправить трек другу.\n"
+        f"• <b>Скачивание по ссылкам:</b> <i>YouTube, SoundCloud, Яндекс Музыка, Spotify, Apple Music, TikTok, Instagram, Deezer, Shazam</i>.\n"
+        f"• <b>Редактор тегов и обложки:</b> скинь свой <b>MP3, WAV или FLAC</b> — сможешь поменять/добавить/удалить обложку, название и автора!\n\n"
+        f"🎚 <b>Твое качество звука:</b> <code>{bitrate_str}</code>\n"
+        f"🎁 <i>Хочешь 320 kbps и скачивание альбомов целиком? Просто перешли любой скачанный трек другу — в кнопку «Найти песню» под MP3 уже вшита твоя ссылка!</i>\n\n"
+        f"👇 <b>Отправь голосовое, видео, ссылку, название песни или свой аудиофайл:</b>"
+    )
+
+    await message.answer(welcome_text, parse_mode="HTML", reply_markup=get_main_inline_kb(user.id))
+
+    if is_new:
+        log_kb = InlineKeyboardBuilder()
+        log_kb.add(types.InlineKeyboardButton(text="💎 Выдать фулл-права (PRO)", callback_data=f"givepro:{user.id}"))
+        await send_log(
+            f"🆕 <b>Новый пользователь:</b> {html.escape(user.full_name)}\n"
+            f"• Юз: @{user.username or 'нет'}\n"
+            f"• ID: <code>{user.id}</code>\n"
+            f"• От реферала: <code>{credited_ref or 'нет'}</code>",
+            reply_markup=log_kb.as_markup(),
+        )
+
+@dp.callback_query(F.data == "shazam_info")
+async def cb_shazam_info(call: types.CallbackQuery):
+    await call.answer()
+    await call.message.answer(
+        "🎤 <b>Как работает распознавание музыки (Shazam + AI):</b>\n\n"
+        "1. <b>Голосовое сообщение:</b> запиши играющую рядом музыку или просто <b>напой мелодию / слова из песни</b> в голосовое — бот распознает трек и сразу пришлёт его в MP3!\n"
+        "2. <b>Видео или кружочек:</b> перешли сюда любое видео из TikTok, Reels или кружочек — бот вытащит из него звук в MP3, а также автоматически определит название трека (даже если это <i>sped up / slowed</i> ремикс) и даст кнопку на скачивание полной оригинальной песни!",
+        parse_mode="HTML",
+    )
+
+@dp.callback_query(F.data == "editor_info")
+async def cb_editor_info(call: types.CallbackQuery):
+    await call.answer()
+    await call.message.answer(
+        "🎛 <b>Как пользоваться редактором треков и обложек:</b>\n\n"
+        "1. Просто отправь или перешли мне любой аудиофайл (<b>MP3, WAV, FLAC, M4A, OGG</b>).\n"
+        "2. Откроется меню редактора, где ты сможешь:\n"
+        "   • 🔍 <b>Распознать трек через Shazam</b> (автоматически заполнит автора, название и обложку)\n"
+        "   • ✏️ Изменить <b>Название</b> трека\n"
+        "   • 👤 Изменить <b>Автора</b> (исполнителя)\n"
+        "   • 🖼 <b>Добавить, заменить или удалить обложку</b>\n"
+        "3. Нажми <b>«✅ Сохранить и получить MP3»</b> — и бот пришлёт готовый MP3 с новыми тегами и обложкой!",
+        parse_mode="HTML",
+    )
+
+@dp.callback_query(F.data == "my_pro")
+async def cb_my_pro(call: types.CallbackQuery):
+    uid = call.from_user.id
+    _ensure_ref_record(uid, username=call.from_user.username)
+    pro = is_pro_user(uid)
+    invited = get_invited_count(uid)
+    ref_link = get_ref_link(uid)
+
+    status_line = "💎 <b>PRO активен (320 kbps + альбомы целиком)</b>" if pro else f"🔒 <b>Базовый (192 kbps)</b> — приглашено {invited}/{PRO_REQUIRED_REFS} др."
+    text = (
+        f"👤 <b>Твой профиль</b>\n\n"
+        f"• Статус: {status_line}\n"
+        f"• Приглашено друзей: <b>{invited}</b>\n\n"
+        f"🔗 <b>Твоя реферальная ссылка:</b>\n<code>{ref_link}</code>\n\n"
+        f"💡 <i>Совет: тебе даже не обязательно кидать ссылку отдельно — просто пересылай скачанные MP3 друзьям или отправляй треки в чаты через <code>@{BOT_USERNAME}</code>! В подпись «Найти песню» под каждым треком уже вшита твоя ссылка.</i>"
+    )
+    await call.answer()
+    await call.message.answer(text, parse_mode="HTML")
+
+@dp.callback_query(F.data == "support")
+async def cb_support(call: types.CallbackQuery, state: FSMContext):
+    await state.set_state(SupportStates.waiting_for_ticket)
+    await call.answer()
+    await call.message.answer(
+        "🆘 <b>Напиши свой вопрос или опиши проблему одним сообщением</b>, и я передам его администратору.\n"
+        "Для отмены нажми /start.",
+        parse_mode="HTML",
+    )
+
+@dp.message(SupportStates.waiting_for_ticket)
+async def handle_support_ticket(message: types.Message, state: FSMContext):
+    await state.clear()
+    user = message.from_user
+    await send_log(
+        f"📩 <b>Обращение в поддержку</b> от {html.escape(user.full_name)} (@{user.username or 'нет'}, ID: <code>{user.id}</code>):\n\n"
+        f"{html.escape(message.text or message.caption or '[медиафайл]')}"
+    )
+    await message.reply("✅ Твое сообщение отправлено! Администратор скоро проверит его.")
+
+
+# --- КОНВЕРТАЦИЯ ВИДЕО И КРУЖОЧКОВ В MP3 + АВТО-SHAZAM ТРЕКА ИЗ ВИДЕО ---
+@dp.message(F.video | F.video_note | F.document.mime_type.startswith("video/"))
+async def handle_video_to_mp3(message: types.Message):
+    if message.chat.id == LOG_GROUP_ID:
+        return
+
+    user = message.from_user
+    register_user(user.id, username=user.username)
+
+    media = message.video or message.video_note or message.document
+    if media.file_size and media.file_size > TG_VIDEO_DL_LIMIT:
+        return await message.reply(
+            "⚠️ <b>Видео слишком большое!</b>\n"
+            "Telegram разрешает ботам скачивать видеофайлы напрямую размером до <b>20 МБ</b>.\n"
+            "Если это ролик с YouTube, TikTok или Instagram — просто пришли мне <b>ссылку</b> на него!",
+            parse_mode="HTML",
+        )
+
+    status_msg = await message.reply("⏳ Извлекаю звук из видео в MP3 и распознаю трек через Shazam...")
+    uid_tag = f"{user.id}_{uuid.uuid4().hex[:8]}"
+    video_path = DOWNLOAD_DIR / f"vid_{uid_tag}.mp4"
+    mp3_path = DOWNLOAD_DIR / f"vid_{uid_tag}.mp3"
+    raw_frame_path = DOWNLOAD_DIR / f"frame_{uid_tag}.jpg"
+    cover_path = DOWNLOAD_DIR / f"cover_{uid_tag}.jpg"
+
+    try:
+        async with download_semaphore:
+            await bot.download(media, destination=video_path)
+            bitrate = get_user_bitrate(user.id)
+
+            cmd_audio = [
+                "ffmpeg", "-y", "-i", str(video_path),
+                "-vn", "-acodec", "libmp3lame", "-b:a", f"{bitrate}k",
+                str(mp3_path),
+            ]
+            proc = await asyncio.to_thread(subprocess.run, cmd_audio, capture_output=True)
+            if proc.returncode != 0 or not mp3_path.exists():
+                raise RuntimeError("Не удалось извлечь аудиодорожку из видео.")
+
+            cmd_frame = [
+                "ffmpeg", "-y", "-ss", "00:00:01", "-i", str(video_path),
+                "-frames:v", "1", "-q:v", "2", str(raw_frame_path),
+            ]
+            await asyncio.to_thread(subprocess.run, cmd_frame, capture_output=True)
+            final_thumb = await asyncio.to_thread(
+                prepare_thumbnail,
+                raw_frame_path if raw_frame_path.exists() else None,
+                cover_path,
+                320,
+            )
+
+        # Параллельно пробиваем звук из видео через наш умный Shazam
+        shz_hint, _, _ = await recognize_audio_smart(mp3_path)
+
+        raw_caption = _clean_text(message.caption or "")
+        orig_name = getattr(media, "file_name", "") or ""
+        if orig_name:
+            orig_name = _clean_text(Path(orig_name).stem)
+
+        if shz_hint and shz_hint.title:
+            title = shz_hint.title
+            artist = shz_hint.artist or user.first_name or "Видео"
+        else:
+            title = raw_caption or orig_name or "Аудио из видео"
+            artist = user.first_name or "Видео"
+            art_split, tit_split = _split_artist_title(title)
+            if art_split and tit_split:
+                artist, title = art_split, tit_split
+
+        reply_kb = None
+        if shz_hint and shz_hint.title:
+            q_key = uuid.uuid4().hex[:8]
+            shazam_quick_cache[q_key] = shz_hint
+            kb = InlineKeyboardBuilder()
+            kb.row(
+                types.InlineKeyboardButton(
+                    text=f"⬇️ Скачать полный трек: {shz_hint.search_query[:38]}",
+                    callback_data=f"shzdl:{q_key}",
+                )
+            )
+            reply_kb = kb.as_markup()
+
+        await message.reply_audio(
+            audio=types.FSInputFile(mp3_path, filename=f"{title[:50]}.mp3"),
+            title=title[:64],
+            performer=artist[:64],
+            thumbnail=types.FSInputFile(final_thumb) if final_thumb else None,
+            caption=get_mp3_caption(user.id),
+            parse_mode="HTML",
+            reply_markup=reply_kb,
+        )
+        await status_msg.delete()
+        await send_log(
+            f"🎬 <b>Видео ➡️ MP3 ({bitrate} kbps):</b> {html.escape(artist)} — {html.escape(title)}\n"
+            f"• Юзер: @{user.username or 'нет'} (<code>{user.id}</code>)"
+        )
+    except Exception as exc:
+        logger.warning("Ошибка конвертации видео в MP3: %s", exc, exc_info=True)
+        await status_msg.edit_text("❌ Не удалось извлечь звук из этого видео (возможно, в нем нет аудиодорожки).")
+    finally:
+        for p in (video_path, mp3_path, raw_frame_path, cover_path):
+            if p.exists():
+                try:
+                    p.unlink()
+                except OSError:
+                    pass
+
+@dp.callback_query(F.data.startswith("shzdl:"))
+async def cb_shazam_full_download(call: types.CallbackQuery):
+    q_key = call.data.split(":", 1)[1]
+    hint = shazam_quick_cache.get(q_key)
+    if not hint:
+        return await call.answer("⚠️ Кнопка устарела, отправь видео или название песни заново.", show_alert=True)
+
+    await call.answer("⏳ Скачиваю полную студийную версию...")
+    wait_msg = await call.message.answer(
+        f"⏳ Скачиваю полную версию: <b>{html.escape(hint.search_query)}</b>...",
+        parse_mode="HTML",
+    )
+    target_q = hint.direct_urls[0] if hint.direct_urls else f"ytsearch1:{hint.search_query}"
+    await download_and_send_single(call.message, call.from_user, target_q, status_msg=wait_msg, hint=hint)
+
+
+# --- ОТПРАВКА ОДИНОЧНОГО ТРЕКА ---
+async def download_and_send_single(
+    message: types.Message,
+    user: types.User,
+    target_url_or_query: str,
+    status_msg: types.Message | None = None,
+    hint: MetadataHint | None = None,
+) -> bool:
+    uid_tag = f"{user.id}_{uuid.uuid4().hex[:8]}"
+    out_base = DOWNLOAD_DIR / f"track_{uid_tag}"
+    audio_path: Path | None = None
+    thumb_path: Path | None = None
+    bitrate = get_user_bitrate(user.id)
+
+    try:
+        async with download_semaphore:
+            audio_path, title, artist, dur, thumb_path, vid_id = await asyncio.to_thread(
+                ytdlp_download_audio,
+                target_url_or_query,
+                out_base,
+                bitrate,
+                hint,
+            )
+
+        if audio_path.stat().st_size > TG_FILE_LIMIT:
+            if status_msg:
+                await status_msg.edit_text("⚠️ Аудиофайл получился больше 50 МБ — Telegram не пропускает такие файлы.")
+            return False
+
+        safe_filename = re.sub(r'[\\/*?:"<>|]', "", f"{artist} - {title}")[:80].strip() or "track"
+        sent_msg = await message.answer_audio(
+            audio=types.FSInputFile(audio_path, filename=f"{safe_filename}.mp3"),
+            title=title[:64],
+            performer=artist[:64],
+            duration=dur,
+            thumbnail=types.FSInputFile(thumb_path) if thumb_path else None,
+            caption=get_mp3_caption(user.id),
+            parse_mode="HTML",
+        )
+        if sent_msg.audio and sent_msg.audio.file_id and vid_id:
+            cache_track_file_id(vid_id, sent_msg.audio.file_id, title, artist, dur)
+
+        if status_msg:
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+
+        await send_log(
+            f"✅ <b>Скачан трек ({bitrate} kbps):</b> {html.escape(artist)} — {html.escape(title)}\n"
+            f"• Юзер: @{user.username or 'нет'} (<code>{user.id}</code>)"
+        )
+        return True
+    except Exception as exc:
+        logger.warning("Ошибка скачивания %s: %s", target_url_or_query, exc, exc_info=True)
+        if status_msg:
+            await status_msg.edit_text(
+                "😔 Не удалось скачать этот трек. Попробуй выбрать другую версию из поиска или пришли название текстом."
+            )
+        await send_log(
+            f"⚠️ <b>Ошибка скачивания:</b> <code>{html.escape(target_url_or_query)}</code>\n"
+            f"• Юзер: @{user.username or 'нет'} (<code>{user.id}</code>)\n"
+            f"• Причина: <code>{html.escape(str(exc)[:200])}</code>"
+        )
+        return False
+    finally:
+        for p in (audio_path, thumb_path):
+            if p and p.exists():
+                try:
+                    p.unlink()
+                except OSError:
+                    pass
+
+
+# --- ОБРАБОТКА ТЕКСТА И ССЫЛОК ---
+@dp.message(F.text)
+async def handle_text_or_url(message: types.Message, state: FSMContext):
+    if message.chat.id == LOG_GROUP_ID:
+        return
+
+    cur_state = await state.get_state()
+    if cur_state == AudioEditStates.editing.state:
+        await state.clear()
+        cleanup_audio_edit_session(message.from_user.id)
+
+    user = message.from_user
+    register_user(user.id, username=user.username)
+    raw_text = (message.text or "").strip()
+
+    if raw_text.lower().startswith(f"@{BOT_USERNAME.lower()}"):
+        raw_text = raw_text[len(BOT_USERNAME) + 1:].strip()
+
+    if is_vk_url(raw_text):
+        return await message.reply(
+            "⚠️ Ссылки на ВК не поддерживаются.\n"
+            "Просто напиши мне <b>название песни или исполнителя</b> текстом, и я найду её в высоком качестве!",
+            parse_mode="HTML",
+        )
+
+    candidates = collect_candidate_urls(message)
+    url, platform = find_supported_url(candidates)
+
+    # 1. Если прислали ссылку
+    if url and platform:
+        status_msg = await message.reply("⏳ Обрабатываю ссылку...")
+        resolved_url = await asyncio.to_thread(resolve_short_url, url)
+        res_classified = classify_url(resolved_url)
+        if res_classified:
+            url, platform = res_classified
+
+        if is_album_or_playlist_url(url, platform):
+            if not is_pro_user(user.id):
+                ref_link = get_ref_link(user.id)
+                return await status_msg.edit_text(
+                    f"🔒 <b>Скачивание альбомов и плейлистов целиком доступно в PRO-режиме!</b>\n\n"
+                    f"Пригласи всего <b>{PRO_REQUIRED_REFS} друга</b> (перешли ему любой скачанный трек или отправь свою ссылку), "
+                    f"чтобы открыть скачивание альбомов и максимальное качество <b>320 kbps</b>:\n\n"
+                    f"<code>{ref_link}</code>",
+                    parse_mode="HTML",
+                )
+
+            alb_key = (user.id, url)
+            if alb_key in active_album_downloads:
+                return await status_msg.edit_text("⏳ Этот альбом уже скачивается для тебя, подожди немного!")
+
+            active_album_downloads.add(alb_key)
+            try:
+                alb_title, tracks = await asyncio.to_thread(extract_album_tracks, url, platform)
+                if not tracks:
+                    return await status_msg.edit_text("😔 Не удалось получить список треков альбома. Попробуй скинуть ссылку на конкретный трек.")
+
+                await status_msg.edit_text(
+                    f"💿 <b>Альбом «{html.escape(alb_title)}»</b>\n"
+                    f"Найдено треков: <b>{len(tracks)}</b>. Начинаю загрузку...",
+                    parse_mode="HTML",
+                )
+                for idx, tr_hint in enumerate(tracks[:25], start=1):
+                    try:
+                        await status_msg.edit_text(
+                            f"💿 Скачиваю трек <b>{idx}/{min(len(tracks), 25)}</b>:\n"
+                            f"🎵 {html.escape(tr_hint.search_query)}",
+                            parse_mode="HTML",
+                        )
+                    except Exception:
+                        pass
+                    await download_and_send_single(message, user, f"ytsearch1:{tr_hint.search_query}", status_msg=None, hint=tr_hint)
+                await status_msg.edit_text(f"✅ Загрузка альбома <b>«{html.escape(alb_title)}»</b> завершена!", parse_mode="HTML")
+            finally:
+                active_album_downloads.discard(alb_key)
+            return
+
+        hint = await asyncio.to_thread(extract_metadata_hint, url, platform)
+        if not hint and platform in METADATA_FIRST_PLATFORMS:
+            hint = extract_message_context_hint(message, url)
+
+        if platform in METADATA_FIRST_PLATFORMS:
+            if not hint or not hint.title:
+                return await status_msg.edit_text(
+                    "😔 Не удалось распознать название трека по этой ссылке. Напиши исполнителя и название песни текстом!"
+                )
+            target_q = hint.direct_urls[0] if hint.direct_urls else f"ytsearch1:{hint.search_query}"
+            await status_msg.edit_text(f"⏳ Скачиваю: <b>{html.escape(hint.search_query)}</b>...", parse_mode="HTML")
+            await download_and_send_single(message, user, target_q, status_msg=status_msg, hint=hint)
+        else:
+            await status_msg.edit_text("⏳ Загружаю аудио и конвертирую в MP3...")
+            target_u = canonical_youtube_url(url) if platform == "youtube" else url
+            ok = await download_and_send_single(message, user, target_u, status_msg=status_msg, hint=None)
+            if not ok:
+                ctx_hint = extract_message_context_hint(message, url)
+                if ctx_hint and ctx_hint.title:
+                    await download_and_send_single(message, user, f"ytsearch1:{ctx_hint.search_query}", status_msg=None, hint=ctx_hint)
+        return
+
+    # 2. Текстовый поиск песни
+    query = _clean_text(raw_text)
+    if len(query) < 2:
+        return await message.reply("Напиши название песни, имя артиста или отправь голосовое / ссылку / видео / аудиофайл!")
+
+    status_msg = await message.reply(f"🔎 Ищу: <b>{html.escape(query)}</b>...", parse_mode="HTML")
+    results = await asyncio.to_thread(ytdlp_search_tracks, query, 18)
+
+    if not results:
+        return await status_msg.edit_text("😔 По твоему запросу ничего не найдено. Попробуй написать иначе.")
+
+    session_id = uuid.uuid4().hex[:10]
+    search_sessions[session_id] = {
+        "user_id": user.id,
+        "query": query,
+        "items": results,
+        "created_at": time.time(),
+    }
+    if len(search_sessions) > 500:
+        cutoff = time.time() - 3600
+        for k in [k for k, v in search_sessions.items() if v.get("created_at", 0) < cutoff]:
+            search_sessions.pop(k, None)
+
+    kb = build_search_keyboard(session_id, page=0)
+    await status_msg.edit_text(
+        f"🎶 Результаты по запросу <b>«{html.escape(query)}»</b>:\nВыбери нужный трек для скачивания:",
+        parse_mode="HTML",
+        reply_markup=kb,
+    )
+    await send_log(f"🔎 <b>Поиск:</b> <code>{html.escape(query)}</code> | @{user.username or 'нет'} (<code>{user.id}</code>)")
+
+
+# --- ОБРАБОТКА КНОПОК ПАГИНАЦИИ И СКАЧИВАНИЯ ИЗ ПОИСКА ---
+@dp.callback_query(F.data.startswith("page:"))
+async def cb_search_page(call: types.CallbackQuery):
+    _, session_id, page_str = call.data.split(":")
+    sess = search_sessions.get(session_id)
+    if not sess:
+        return await call.answer("⚠️ Результаты поиска устарели, введи запрос заново.", show_alert=True)
+
+    page = int(page_str)
+    await call.answer()
+    await call.message.edit_reply_markup(reply_markup=build_search_keyboard(session_id, page=page))
+
+@dp.callback_query(F.data.startswith("dl:"))
+async def cb_download_from_search(call: types.CallbackQuery):
+    _, session_id, idx_str = call.data.split(":")
+    sess = search_sessions.get(session_id)
+    if not sess:
+        return await call.answer("⚠️ Кнопка устарела, введи запрос заново.", show_alert=True)
+
+    items: list[dict] = sess.get("items") or []
+    idx = int(idx_str)
+    if idx < 0 or idx >= len(items):
+        return await call.answer("Трек не найден.", show_alert=True)
+
+    item = items[idx]
+    await call.answer("⏳ Начинаю загрузку...")
+    wait_msg = await call.message.answer(f"⏳ Скачиваю: <b>{html.escape(item.get('title', 'Трек'))}</b>...", parse_mode="HTML")
+
+    norm_title, norm_artist = _normalize_track_and_artist(item.get("title") or "", item.get("uploader") or "")
+    hint = MetadataHint(
+        title=norm_title or "Track",
+        artist=norm_artist,
+        duration=item.get("duration"),
+    )
+    hint = await asyncio.to_thread(_enrich_hint_from_catalogs, hint)
+    await download_and_send_single(call.message, call.from_user, item["url"], status_msg=wait_msg, hint=hint)
+
+
+# --- ЗАПУСК БОТА ---
+async def main():
+    logger.info("Запуск бота @%s...", BOT_USERNAME)
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Бот остановлен.")
